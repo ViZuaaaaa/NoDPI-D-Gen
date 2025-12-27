@@ -1222,6 +1222,23 @@ def _pause(msg: str = "\nНажмите Enter, чтобы продолжить..
         pass
 
 
+def _print_disclaimer() -> None:
+    """Print DISCLAIMER.md (if present) to the console.
+
+    This is meant for interactive menu usage.
+    """
+    path = os.path.join(SCRIPT_DIR, "DISCLAIMER.md")
+    print("Disclaimer / limitations\n")
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                print(f.read().rstrip())
+        else:
+            print("DISCLAIMER.md not found.")
+    except Exception as e:
+        _eprint(f"failed to read disclaimer: {e!r}")
+
+
 def _cmd_enable_youtube(cfg_path: str) -> int:
     # Reload raw (don't rely on parsed cfg), update and save.
     raw = load_config(cfg_path)
@@ -1257,6 +1274,7 @@ def interactive_menu(cfg_path: str, cfg: Config, logger: logging.Logger) -> int:
                 ("5", "Autostart status (Windows)"),
                 ("6", "Autostart install (Windows)"),
                 ("7", "Autostart uninstall (Windows)"),
+                ("8", "Disclaimer / limitations (read DISCLAIMER.md)"),
                 ("0", "Exit"),
             ],
         )
@@ -1326,6 +1344,12 @@ def interactive_menu(cfg_path: str, cfg: Config, logger: logging.Logger) -> int:
                 print("Removed autostart.")
             except Exception as e:
                 _eprint(f"uninstall failed: {e!r}")
+            _pause()
+            continue
+
+        if choice == "8":
+            _clear_screen()
+            _print_disclaimer()
             _pause()
             continue
         print("Unknown option.")
