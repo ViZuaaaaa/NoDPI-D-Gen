@@ -2,6 +2,8 @@
 
 **Language:** English | **Русский:** `README.md`
 
+**Community (Telegram):** https://t.me/DisappearGen
+
 License: **Apache-2.0** (see `LICENSE`).
 
 D‑Gen v4 is a **local HTTP/HTTPS proxy** (CONNECT supported). It can **fragment the first TLS ClientHello** based on SNI rules and provides a built‑in **PAC server** for quick browser configuration.
@@ -9,6 +11,23 @@ D‑Gen v4 is a **local HTTP/HTTPS proxy** (CONNECT supported). It can **fragmen
 > Important: this is **not a VPN**. Read `DISCLAIMER.md` for limitations and security notes.
 
 ---
+
+## Why this project / advantages
+
+- **Windows-first UX**: one recommended launcher (`run-dgen4.bat`) and an interactive menu (no need to memorize commands).
+- **Reproducible browser setup**: built-in PAC + Chrome launched with `--proxy-pac-url=...` (reduces issues with system proxy policies/extensions).
+- **HTTPS CONNECT + plain HTTP** proxying, without MITM (no certificate installation).
+- **Domain-targeted behavior (SNI, best-effort)** and multiple TLS ClientHello fragmentation strategies, including per-rule overrides.
+- **Supportability**: `doctor`, a log file, `stats/quiet` console modes, clean shutdown.
+- **Pragmatic extras**: optional upstream CONNECT relay and Windows autostart.
+
+## What the app does
+
+- Starts a local HTTP/HTTPS proxy (CONNECT supported) and a PAC server.
+- Lets you route a browser either via PAC (`http://127.0.0.1:8882/proxy.pac`) or via direct proxy (`127.0.0.1:8881`).
+- For HTTPS tunnels (CONNECT:443), it can inspect the first TLS record (ClientHello) and apply rule-based fragmentation (best-effort SNI parsing).
+- It does **not** decrypt traffic (no MITM). It only relays bytes between client and upstream.
+- Provides presets (`enable-youtube`), diagnostics (`doctor`), and an interactive menu (including a Disclaimer entry).
 
 ## Quick start (Windows) — recommended
 
@@ -61,6 +80,10 @@ run.bat
 - `2` — menu
 - `0` — exit
 
+Screenshot (start screen):
+
+![Start screen](img/start.png)
+
 ---
 
 ## CLI: commands and modes
@@ -99,11 +122,16 @@ Menu options are:
 - `5` — Autostart status (Windows)
 - `6` — Autostart install (Windows)
 - `7` — Autostart uninstall (Windows)
+- `8` — Disclaimer / limitations (read DISCLAIMER.md)
 - `0` — Exit
 
 UI behavior:
 - screen is cleared before menu
 - some actions pause and ask you to press Enter
+
+Screenshot (menu):
+
+![Menu](img/menu.png)
 
 ---
 
