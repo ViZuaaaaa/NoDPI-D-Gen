@@ -1,0 +1,17 @@
+# Logs
+*.log
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Virtualenvs
+.venv/
+venv/
+
+# Editor/OS noise
+.DS_Store
+Thumbs.db
+
+# Local configs (keep the example config tracked)
+# dgen-nodpi4.json
