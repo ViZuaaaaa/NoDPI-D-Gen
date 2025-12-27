@@ -32,6 +32,12 @@ run-dgen4.bat
 
 It also warns that Chrome must be **fully closed** (otherwise proxy/PAC flags may be ignored) and offers to kill `chrome.exe`.
 
+System proxy note:
+- If you use **`run-dgen4.bat`**, you usually do **not** need to configure Windows system proxy: Chrome is launched with `--proxy-pac-url=http://127.0.0.1:8882/proxy.pac`.
+- If you run the proxy separately (`run.bat` / `py dgen_nodpi.py run`) and want other apps/browsers to use D-Gen, configure proxy manually:
+  - PAC URL: `http://127.0.0.1:8882/proxy.pac`
+  - or set HTTP+HTTPS proxy to: `127.0.0.1:8881`
+
 ### 2) Verify
 
 Open YouTube. In the D‑Gen console you should see a live stats line (if `console.mode=stats`).
