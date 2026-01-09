@@ -1,17 +1,8 @@
-# Logs
+﻿/utils/test results
+# --- runtime logs / artifacts (do not commit) ---
+D-Gen/logs/*
+!D-Gen/logs/.gitkeep
 *.log
-
-# Python caches
-__pycache__/
-*.pyc
-
-# Virtualenvs
-.venv/
-venv/
-
-# Editor/OS noise
-.DS_Store
-Thumbs.db
-
-# Local configs (keep the example config tracked)
-# dgen-nodpi4.json
+*.tmp
+*.bak
+*.backup

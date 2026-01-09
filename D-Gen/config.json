@@ -1,0 +1,8 @@
+{
+  "domains": ["discord.com", "youtube.com"],
+  "targetDescription": "D-Gen launcher default",
+  "strategy": "strategies\\general.bat",
+  "enableRemote": false,
+  "apiKey": "",
+  "baseUri": "http://127.0.0.1:11434/v1"
+}
