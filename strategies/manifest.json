@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "defaults": {
+    "enabled": false,
+    "priority": 0
+  },
+  "overrides": {
+    "general.bat": {
+      "enabled": true,
+      "priority": 100,
+      "tags": ["baseline", "discord", "youtube", "roblox"]
+    },
+    "general (ALT11).bat": {
+      "enabled": true,
+      "priority": 95,
+      "tags": ["alt", "heavy", "discord", "roblox"]
+    },
+    "general (FAKE TLS AUTO ALT3).bat": {
+      "enabled": true,
+      "priority": 94,
+      "tags": ["fake_tls_auto", "heavy", "discord", "roblox"]
+    },
+    "general (ALT).bat": {
+      "enabled": true,
+      "priority": 90,
+      "tags": ["alt", "discord", "youtube", "roblox"]
+    },
+    "general (ALT7).bat": {
+      "enabled": true,
+      "priority": 85,
+      "tags": ["alt", "discord", "roblox"]
+    },
+    "general (FAKE TLS AUTO).bat": {
+      "enabled": true,
+      "priority": 80,
+      "tags": ["fake_tls_auto", "discord", "youtube", "roblox"]
+    }
+  }
+}

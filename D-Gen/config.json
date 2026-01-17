@@ -1,0 +1,13 @@
+{
+    "domains":  [
+                    "discord.com",
+                    "youtube.com",
+                    "roblox.com"
+                ],
+    "targetDescription":  "D-Gen launcher default",
+    "strategy":  "strategies\\general.bat",
+    "aggressiveMode":  true,
+    "enableRemote":  false,
+    "apiKey":  "",
+    "baseUri":  "http://127.0.0.1:11434/v1"
+}
