@@ -1,0 +1,28 @@
+# list-ai.txt - D-Gen camouflage hostnames (offline by default)
+# Managed by utils/ai_request_rewriter.ps1
+# One hostname per line, lower-case, without protocol or slashes.
+
+# Added 2025-12-29 23:01:06 by D-Gen
+cdn.discordapp.com
+www.amazon.com
+www.microsoft.com
+
+# Added 2025-12-29 23:05:24 by D-Gen
+www.apple.com
+www.google.com
+
+# Added 2025-12-29 23:08:18 by D-Gen
+www.reddit.com
+
+# Added 2025-12-29 23:09:52 by D-Gen
+www.wikipedia.org
+www.youtube.com
+
+# Added 2025-12-29 23:14:02 by D-Gen
+www.bing.com
+
+# Added 2025-12-30 11:01:38 by D-Gen
+www.cloudflare.com
+
+# Added 2026-01-13 11:47:41 by D-Gen
+default

@@ -1,0 +1,17 @@
+/utils/test results
+# --- runtime logs / artifacts (do not commit) ---
+D-Gen/logs/*
+!D-Gen/logs/.gitkeep
+*.log
+*.tmp
+*.bak
+*.backup
+/bin/
+/dist/
+
+# --- Anti-copy: do not publish engine sources or build outputs ---
+/engine/src/
+/engine/out/
+# --- engine private sources / build output (anti-copy) ---
+/engine/src/
+/engine/out/

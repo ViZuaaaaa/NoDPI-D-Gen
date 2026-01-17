@@ -1,0 +1,25 @@
+{
+    "Profiles":  {
+                     "cb013a6e1d4209c7":  {
+                                              "LastBestStrategy":  "general (FAKE TLS AUTO ALT3).bat",
+                                              "LastBestPassed":  5,
+                                              "LastBestTotal":  5,
+                                              "LastBestBlockType":  "DPI/HTTP",
+                                              "LastBestAt":  "2026-01-16T12:25:59.0153357+03:00",
+                                              "LastBestGameFilter":  "1024-65535",
+                                              "LastBestAggressive":  false,
+                                              "LastBestQuicBlock":  false
+                                          },
+                     "6532e03127d7c42e":  {
+                                              "LastBestStrategy":  "general (ALT).bat",
+                                              "LastBestPassed":  6,
+                                              "LastBestTotal":  6,
+                                              "LastBestBlockType":  "DPI/HTTP",
+                                              "LastBestAt":  "2026-01-17T03:33:14.8509222+03:00",
+                                              "LastBestGameFilter":  "1024-65535",
+                                              "LastBestAggressive":  true,
+                                              "LastBestQuicBlock":  false
+                                          }
+                 },
+    "Version":  2
+}
