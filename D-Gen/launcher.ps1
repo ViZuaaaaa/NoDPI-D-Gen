@@ -1,4 +1,4 @@
-﻿﻿﻿﻿# D-Gen | https://t.me/DisappearGen
+﻿﻿﻿﻿﻿﻿# D-Gen | https://t.me/DisappearGen
 param(
     [switch]$AutoStart,
 
@@ -48,7 +48,9 @@ function Clear-CurrentLogs {
     } catch { }
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    # Keep launcher run history in dgen-launch.log; only reset the per-run stdout/stderr buffers.
+    # Each Start should begin with clean logs in the launcher UI (it reads from $script:activeLogPath).
+    try { [System.IO.File]::WriteAllText($script:activeLogPath, "", $utf8NoBom) } catch { }
+    # Reset the per-run stdout/stderr buffers.
     try { [System.IO.File]::WriteAllText($script:generatorOutPath, "", $utf8NoBom) } catch { }
     try { [System.IO.File]::WriteAllText($script:generatorErrPath, "", $utf8NoBom) } catch { }
     try { [System.IO.File]::WriteAllText($script:strategyOutPath, "", $utf8NoBom) } catch { }

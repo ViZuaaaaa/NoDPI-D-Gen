@@ -6,7 +6,7 @@
                 ],
     "targetDescription":  "D-Gen launcher default",
     "strategy":  "strategies\\general.bat",
-    "aggressiveMode":  true,
+    "aggressiveMode":  false,
     "enableRemote":  false,
     "apiKey":  "",
     "baseUri":  "http://127.0.0.1:11434/v1"
