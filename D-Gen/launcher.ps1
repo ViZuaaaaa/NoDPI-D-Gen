@@ -1,4 +1,4 @@
-﻿﻿# D-Gen | https://t.me/DisappearGen
+﻿﻿﻿﻿# D-Gen | https://t.me/DisappearGen
 param(
     [switch]$AutoStart,
 
@@ -48,7 +48,7 @@ function Clear-CurrentLogs {
     } catch { }
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    try { [System.IO.File]::WriteAllText($script:activeLogPath, "", $utf8NoBom) } catch { }
+    # Keep launcher run history in dgen-launch.log; only reset the per-run stdout/stderr buffers.
     try { [System.IO.File]::WriteAllText($script:generatorOutPath, "", $utf8NoBom) } catch { }
     try { [System.IO.File]::WriteAllText($script:generatorErrPath, "", $utf8NoBom) } catch { }
     try { [System.IO.File]::WriteAllText($script:strategyOutPath, "", $utf8NoBom) } catch { }
@@ -2643,8 +2643,6 @@ $toggleBtn.Add_Click({
             $script:postStartTwitterTuned = $false
             $script:postStartRobloxRetried = $false
             $script:activeLogPath = $logPath
-            try { Reset-TextLog -path $script:activeLogPath } catch { }
-
             try { Clear-CurrentLogs } catch { }
 
             try { if ($mainTabs -and $logsTab) { $mainTabs.SelectedTab = $logsTab } } catch { }
