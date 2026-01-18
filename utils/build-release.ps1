@@ -90,6 +90,12 @@ $dstBin = Join-Path $stage 'bin'
 New-Item -ItemType Directory -Path $dstBin -Force | Out-Null
 Copy-Item -Path (Join-Path $BinSource '*') -Destination $dstBin -Recurse -Force
 
+# 4) Don't ship machine-local autopick cache/state
+$autopickState = Join-Path $dstBin 'dgen-autopick.state'
+if (Test-Path -LiteralPath $autopickState) {
+    Remove-Item -LiteralPath $autopickState -Force
+}
+
 $dgenExe = Join-Path $dstBin 'DGen.exe'
 $unexpectedExeNames = @(
     Get-ChildItem -LiteralPath $dstBin -Filter '*.exe' -File -ErrorAction SilentlyContinue |
