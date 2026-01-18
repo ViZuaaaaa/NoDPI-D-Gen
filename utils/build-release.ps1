@@ -91,10 +91,14 @@ New-Item -ItemType Directory -Path $dstBin -Force | Out-Null
 Copy-Item -Path (Join-Path $BinSource '*') -Destination $dstBin -Recurse -Force
 
 $dgenExe = Join-Path $dstBin 'DGen.exe'
-$winwsExe = Join-Path $dstBin 'winws.exe'
+$unexpectedExeNames = @(
+    Get-ChildItem -LiteralPath $dstBin -Filter '*.exe' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne 'DGen.exe' } |
+        Select-Object -ExpandProperty Name
+)
 
-if (Test-Path -LiteralPath $winwsExe) {
-    throw "BinSource still contains winws.exe. Rename it to DGen.exe before building the release."
+if ($unexpectedExeNames -and $unexpectedExeNames.Count -gt 0) {
+    throw ("Release bin contains unexpected .exe files: {0}. Only DGen.exe should be present." -f ($unexpectedExeNames -join ', '))
 }
 
 if (-not (Test-Path -LiteralPath $dgenExe)) {

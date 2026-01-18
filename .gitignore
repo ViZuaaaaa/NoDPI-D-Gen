@@ -8,6 +8,7 @@ D-Gen/logs/*
 *.backup
 /bin/
 /dist/
+/.vscode/
 
 # --- Anti-copy: do not publish engine sources or build outputs ---
 /engine/src/

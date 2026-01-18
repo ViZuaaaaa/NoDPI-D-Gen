@@ -1,4 +1,4 @@
-﻿# D-Gen | https://t.me/DisappearGen
+﻿﻿# D-Gen | https://t.me/DisappearGen
 param(
     [switch]$AutoStart,
 
@@ -2661,12 +2661,49 @@ $toggleBtn.Add_Click({
                 } catch { }
 
                 $conflicting = @()
-                foreach ($svcName in @('zapret', 'winws1', 'winws2', 'GoodbyeDPI')) {
-                    try {
-                        $svc = Get-Service -Name $svcName -ErrorAction Stop
-                        if ($svc -and $svc.Status -eq 'Running') { $conflicting += $svc }
-                    } catch { }
-                }
+                try {
+                    # Generic conflict detection (anti-brand): look for RUNNING services whose executable folder
+                    # contains WinDivert binaries. These services often conflict with D-Gen.
+                    $runningSvcs = @(Get-Service -ErrorAction Stop | Where-Object { $_.Status -eq 'Running' })
+                    foreach ($svc in $runningSvcs) {
+                        try {
+                            if ($svc.Name -like 'WinDivert*') { continue }
+                            if ($svc.Name -eq 'DGen') { continue }
+
+                            $img = $null
+                            try {
+                                $img = (Get-ItemProperty -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Services\{0}" -f $svc.Name) -ErrorAction Stop).ImagePath
+                            } catch { }
+
+                            if (-not $img) { continue }
+
+                            $raw = [Environment]::ExpandEnvironmentVariables([string]$img).Trim()
+                            $exe = $null
+                            if ($raw.StartsWith('"')) {
+                                $end = $raw.IndexOf('"', 1)
+                                if ($end -gt 1) { $exe = $raw.Substring(1, $end - 1) }
+                            } else {
+                                $exe = ($raw -split '\s+')[0]
+                            }
+
+                            if (-not $exe) { continue }
+                            if ($exe -match '^[A-Za-z]:\\Windows\\') { continue }
+                            if (-not (Test-Path -LiteralPath $exe)) { continue }
+
+                            $dir = Split-Path -Parent $exe
+                            $hasWinDivert = $false
+                            try {
+                                $hasWinDivert = (
+                                    (Test-Path -LiteralPath (Join-Path $dir 'WinDivert.dll')) -or
+                                    (Test-Path -LiteralPath (Join-Path $dir 'WinDivert64.sys')) -or
+                                    (Test-Path -LiteralPath (Join-Path $dir 'WinDivert.sys'))
+                                )
+                            } catch { }
+
+                            if ($hasWinDivert) { $conflicting += $svc }
+                        } catch { }
+                    }
+                } catch { }
 
                 if ($conflicting.Count -gt 0) {
                     $lines = ($conflicting | ForEach-Object { " - $($_.Name) ($($_.Status))" }) -join "`r`n"
