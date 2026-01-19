@@ -41,6 +41,76 @@ $powershellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powe
 
 if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir | Out-Null }
 
+function Get-IpsetAllHealth {
+    param([string]$path)
+
+    if (-not $path) { return $null }
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+
+    $fi = Get-Item -LiteralPath $path
+    $lineCount = 0
+    $cidrLike = 0
+
+    Get-Content -LiteralPath $path -ReadCount 8192 | ForEach-Object {
+        $lineCount += $_.Count
+        foreach ($line in $_) {
+            $l = ([string]$line).Trim()
+            if (-not $l) { continue }
+            if ($l -match '^[0-9a-fA-F:.]+/\d{1,3}$') { $cidrLike++ }
+        }
+    }
+
+    return [pscustomobject]@{
+        Path = $path
+        SizeBytes = [int64]$fi.Length
+        Lines = $lineCount
+        CidrLike = $cidrLike
+    }
+}
+
+function Ensure-IpsetAllHealthy {
+    $minCidr = 1000
+    $minLines = 1000
+    $minBytes = 50000
+
+    $path = $ipsetAllPath
+    $backup = Join-Path $listsDir 'ipset-all.txt.backup'
+
+    $h = Get-IpsetAllHealth -path $path
+    $needFix = $false
+    $reason = ''
+    if (-not $h) {
+        $needFix = $true
+        $reason = 'missing'
+    } elseif ($h.CidrLike -lt $minCidr -or $h.Lines -lt $minLines -or $h.SizeBytes -lt $minBytes) {
+        $needFix = $true
+        $reason = ("too small: cidrLike={0}, lines={1}, bytes={2}" -f $h.CidrLike, $h.Lines, $h.SizeBytes)
+    }
+
+    if (-not $needFix) { return $true }
+
+    $hb = Get-IpsetAllHealth -path $backup
+    if ($hb -and $hb.CidrLike -ge $minCidr -and $hb.Lines -ge $minLines -and $hb.SizeBytes -ge $minBytes) {
+        try {
+            Copy-Item -Force -LiteralPath $backup -Destination $path
+            $h2 = Get-IpsetAllHealth -path $path
+            Write-Log ("IpsetAll: restored from backup (reason={0}, after: cidrLike={1}, lines={2}, bytes={3})" -f $reason, $h2.CidrLike, $h2.Lines, $h2.SizeBytes)
+            return $true
+        } catch {
+            Write-Log "IpsetAll: restore from backup failed: $($_.Exception.Message)"
+        }
+    }
+
+    Write-Log ("IpsetAll: WARNING suspicious ipset-all.txt ({0})." -f $reason)
+    try {
+        $msg = "Your lists\\ipset-all.txt seems incomplete/damaged.\r\n\r\n" +
+            "This can make the bypass fail on many providers.\r\n\r\n" +
+            "Fix: use the Release zip (not Code ZIP) and ensure lists\\ipset-all.txt is intact."
+        [System.Windows.Forms.MessageBox]::Show($msg, "D-Gen", 'OK', 'Warning') | Out-Null
+    } catch { }
+    return $false
+}
+
 function Clear-CurrentLogs {
     try {
         if ($launcherLogBox) { $launcherLogBox.Clear() }
@@ -161,14 +231,17 @@ function Parse-AutopickFromEngineLogLines {
     }
 
     $autopick = $null
-    if ($keyLine -and ($keyLine -match 'autopick:\s*key=(?<key>\S+)\s+profile=(?<profile>\S+)(?:\s+score=(?<score>-?\d+))?(?:\s+mode=(?<mode>\S+))?')) {
+    if ($keyLine -and ($keyLine -match 'autopick:\s*key=(?<key>\S+)\s+profile=(?<profile>\S+)(?:\s+score=(?<score>-?\d+))?(?:\s+mode=(?<mode>\S+))?(?:\s+ms=(?<ms>\d+))?')) {
         $score = $null
         if ($Matches['score']) { try { $score = [int]$Matches['score'] } catch { $score = $null } }
+        $ms = $null
+        if ($Matches['ms']) { try { $ms = [int]$Matches['ms'] } catch { $ms = $null } }
         $autopick = [pscustomobject]@{
             key = $Matches['key']
             profile = $Matches['profile']
             score = $score
             mode = [string]$Matches['mode']
+            ms = $ms
         }
     }
 
@@ -537,11 +610,57 @@ function Get-RobloxLogDir {
         (Join-Path $env:TEMP "Roblox\logs")
     )
 
-    foreach ($p in $candidates) {
-        if ($p -and (Test-Path $p)) { return $p }
+    # Microsoft Store Roblox can write logs under:
+    # %LOCALAPPDATA%\Packages\ROBLOXCORPORATION.ROBLOX*\LocalState\logs
+    try {
+        $pkgRoot = Join-Path $env:LOCALAPPDATA 'Packages'
+        if ($pkgRoot -and (Test-Path -LiteralPath $pkgRoot)) {
+            $pkgs = @(
+                Get-ChildItem -LiteralPath $pkgRoot -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -like 'ROBLOXCORPORATION.ROBLOX*' } |
+                    Sort-Object LastWriteTime -Descending
+            )
+            foreach ($pkg in $pkgs) {
+                $p1 = Join-Path $pkg.FullName 'LocalState\logs'
+                $p2 = Join-Path $pkg.FullName 'LocalState\Roblox\logs'
+                if ($p1) { $candidates += $p1 }
+                if ($p2) { $candidates += $p2 }
+            }
+        }
+    } catch { }
+
+    $existing = @(
+        $candidates |
+            Where-Object { $_ } |
+            ForEach-Object { [string]$_ } |
+            Sort-Object -Unique |
+            Where-Object { Test-Path -LiteralPath $_ -ErrorAction SilentlyContinue }
+    )
+
+    if (-not $existing -or $existing.Count -eq 0) { return $null }
+
+    # Prefer the log dir that has the newest log file.
+    $best = $null
+    $bestTime = [datetime]::MinValue
+    foreach ($p in $existing) {
+        $t = $null
+        try {
+            $latest = @(Get-ChildItem -LiteralPath $p -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+            if ($latest -and $latest.Count -gt 0) {
+                $t = $latest[0].LastWriteTime
+            } else {
+                $t = (Get-Item -LiteralPath $p -ErrorAction SilentlyContinue).LastWriteTime
+            }
+        } catch { $t = $null }
+
+        if ($t -and $t -gt $bestTime) {
+            $bestTime = $t
+            $best = $p
+        }
     }
 
-    return $null
+    if ($best) { return $best }
+    return $existing[0]
 }
 
 function Test-IsPrivateOrLocalIp {
@@ -826,7 +945,9 @@ function Ensure-DGenEngineReady {
     try { Hide-LoadingOverlay } catch { }
     try { $statusLabel.Text = "Start blocked: missing DGen.exe" } catch { }
 
-    $msg = "DGen.exe not found in bin.\r\n\r\nFix: rename the engine file to DGen.exe and make sure it is located at:\r\n\r\n$exePath"
+    $msg = "DGen.exe not found in bin.\r\n\r\n" +
+        "Most common cause: you downloaded the source 'Code ZIP' from GitHub (it does not include bin/).\r\n\r\n" +
+        "Fix: use the Release zip (recommended), OR place/rename the engine binary to:\r\n\r\n$exePath"
     try { [System.Windows.Forms.MessageBox]::Show($msg, 'D-Gen', 'OK', 'Error') | Out-Null } catch { }
     return $false
 }
@@ -1041,6 +1162,8 @@ function Get-NetworkProfileKey {
     try {
         $dns = New-Object System.Collections.Generic.List[string]
         $gw = New-Object System.Collections.Generic.List[string]
+        $ipPrefixes = New-Object System.Collections.Generic.List[string]
+        $dhcp = New-Object System.Collections.Generic.List[string]
 
         foreach ($ni in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
             if ($ni.OperationalStatus -ne [System.Net.NetworkInformation.OperationalStatus]::Up) { continue }
@@ -1062,12 +1185,35 @@ function Get-NetworkProfileKey {
                     if ($addr -and $addr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { $gw.Add($addr.IPAddressToString) | Out-Null }
                 } catch { }
             }
+
+            foreach ($u in @($ipProps.UnicastAddresses)) {
+                try {
+                    $addr = $u.Address
+                    if (-not $addr) { continue }
+                    if ($addr.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { continue }
+                    $s = $addr.IPAddressToString
+                    if (-not $s) { continue }
+                    if ($s -like '127.*' -or $s -like '169.254.*') { continue }
+                    $parts = $s.Split('.')
+                    if ($parts.Count -eq 4) {
+                        $ipPrefixes.Add((@($parts[0], $parts[1], $parts[2]) -join '.')) | Out-Null
+                    }
+                } catch { }
+            }
+
+            foreach ($d in @($ipProps.DhcpServerAddresses)) {
+                try {
+                    if ($d -and $d.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { $dhcp.Add($d.IPAddressToString) | Out-Null }
+                } catch { }
+            }
         }
 
         $dnsKey = (@($dns | Where-Object { $_ } | Sort-Object -Unique) -join ',')
         $gwKey = (@($gw | Where-Object { $_ } | Sort-Object -Unique) -join ',')
-        $raw = ("dns={0}|gw={1}" -f $dnsKey, $gwKey)
-        if (-not $dnsKey -and -not $gwKey) { $raw = 'none' }
+        $ipKey = (@($ipPrefixes | Where-Object { $_ } | Sort-Object -Unique) -join ',')
+        $dhcpKey = (@($dhcp | Where-Object { $_ } | Sort-Object -Unique) -join ',')
+        $raw = ("dns={0}|gw={1}|ip={2}|dhcp={3}" -f $dnsKey, $gwKey, $ipKey, $dhcpKey)
+        if (-not $dnsKey -and -not $gwKey -and -not $ipKey -and -not $dhcpKey) { $raw = 'none' }
 
         $sha = [System.Security.Cryptography.SHA256]::Create()
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
@@ -1416,14 +1562,18 @@ function Run-Generator {
     New-Item -ItemType File -Path $script:generatorOutPath -Force | Out-Null
     New-Item -ItemType File -Path $script:generatorErrPath -Force | Out-Null
 
+    $gp = ([string]$generatorPath).Replace([string][char]34, '')
     $args = @(
         "-NoProfile", "-ExecutionPolicy", "Bypass",
-        "-File", $generatorPath,
+        "-File", "`"$gp`"",
         "-Domains"
     )
 
     if ($cfg.domains) { $args += $cfg.domains }
-    if ($cfg.targetDescription) { $args += @("-TargetDescription", $cfg.targetDescription) }
+    if ($cfg.targetDescription) {
+        $td = ([string]$cfg.targetDescription).Replace([string][char]34, '')
+        $args += @("-TargetDescription", "`"$td`"")
+    }
 
     if ($cfg.enableRemote -and $cfg.apiKey) {
         $args += @("-EnableRemote", "-ApiKey", $cfg.apiKey)
@@ -2895,6 +3045,17 @@ function Tick-StartState {
             try { $script:generatorProc.Refresh() } catch { }
             if (-not $script:generatorProc.HasExited) { return }
 
+            $genExit = 0
+            try { $genExit = [int]$script:generatorProc.ExitCode } catch { $genExit = 0 }
+            $genMs = 0
+            try {
+                if ($script:generatorStartedAt) {
+                    $genMs = [int]((Get-Date) - $script:generatorStartedAt).TotalMilliseconds
+                }
+            } catch { $genMs = 0 }
+            Write-Log ("Generator finished: exitCode={0} ms={1}" -f $genExit, $genMs)
+            $script:generatorStartedAt = $null
+
             $script:generatorProc = $null
 
             $statusLabel.Text = "Starting strategy..."
@@ -2973,6 +3134,7 @@ function Tick-StartState {
 
         $script:startState = "Idle"
         $script:generatorProc = $null
+        $script:generatorStartedAt = $null
         $script:strategies = @()
         $script:strategyIndex = 0
         $script:waitUntil = $null
@@ -3046,6 +3208,14 @@ $toggleBtn.Add_Click({
 
             if (-not (Ensure-DGenEngineReady)) {
                 return
+            }
+
+            try {
+                if (-not (Ensure-IpsetAllHealthy)) {
+                    Write-Log "IpsetAll: continuing anyway (reduced universality)"
+                }
+            } catch {
+                Write-Log "IpsetAll check failed: $($_.Exception.Message)"
             }
 
             try {
@@ -3209,6 +3379,7 @@ $toggleBtn.Add_Click({
 
             $statusLabel.Text = "Generating..."
             try { Set-LoadingOverlayText "Generating..." } catch { }
+            $script:generatorStartedAt = Get-Date
             $script:generatorProc = Run-Generator -cfg $cfg -runId $script:runId
 
             $script:strategies = @()

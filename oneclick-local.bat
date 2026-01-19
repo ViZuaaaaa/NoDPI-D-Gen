@@ -18,7 +18,7 @@ if exist "%WSCRIPT%" if exist "%VBS%" (
 rem
 if exist "%PS%" if exist "%LAUNCHER%" (
   "%PS%" -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$ps='%PS%'; $launcher='%LAUNCHER%'; $wd='%ROOT%'; Start-Process -FilePath $ps -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-STA','-File', $launcher) -WorkingDirectory $wd -Verb RunAs -WindowStyle Hidden"
+    "$ps='%PS%'; $launcher='%LAUNCHER%'; $wd='%ROOT%'; $q=[char]34; $launcherArg=$q + $launcher + $q; Start-Process -FilePath $ps -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-STA','-WindowStyle','Hidden','-File', $launcherArg) -WorkingDirectory $wd -Verb RunAs -WindowStyle Hidden"
   exit /b 0
 )
 
