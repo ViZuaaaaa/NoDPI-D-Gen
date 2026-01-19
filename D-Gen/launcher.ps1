@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿# D-Gen | https://t.me/DisappearGen
+﻿# D-Gen | https://t.me/DisappearGen
 param(
     [switch]$AutoStart,
 
@@ -31,8 +31,9 @@ $botStatePath = Join-Path $PSScriptRoot "bot-state.json"
 $script:activeLogPath = $logPath
 $defaultGeneratorOutPath = Join-Path $logsDir "dgen-generator.stdout.log"
 $defaultGeneratorErrPath = Join-Path $logsDir "dgen-generator.stderr.log"
-$defaultStrategyOutPath = Join-Path $logsDir "dgen-strategy.stdout.log"
-$defaultStrategyErrPath = Join-Path $logsDir "dgen-strategy.stderr.log"
+$defaultStrategyOutPath = Join-Path $logsDir "engine.stdout.log"
+$defaultStrategyErrPath = Join-Path $logsDir "engine.log"
+$defaultSummaryPath = Join-Path $logsDir "dgen-summary.json"
 $powershellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 
 # Engine-side autopick (anti-copy): launcher no longer embeds target URL lists / scoring logic.
@@ -55,6 +56,261 @@ function Clear-CurrentLogs {
     try { [System.IO.File]::WriteAllText($script:generatorErrPath, "", $utf8NoBom) } catch { }
     try { [System.IO.File]::WriteAllText($script:strategyOutPath, "", $utf8NoBom) } catch { }
     try { [System.IO.File]::WriteAllText($script:strategyErrPath, "", $utf8NoBom) } catch { }
+    try { [System.IO.File]::WriteAllText($defaultSummaryPath, "", $utf8NoBom) } catch { }
+
+    try { $script:lastSummaryRunId = '' } catch { }
+    try { $script:lastSummarySourcePath = '' } catch { }
+    try { $script:lastSummarySourceWriteUtc = [datetime]::MinValue } catch { }
+}
+
+$script:lastSummaryRunId = ''
+$script:lastSummarySourcePath = ''
+$script:lastSummarySourceWriteUtc = [datetime]::MinValue
+
+function Cleanup-LegacyRunLogs {
+    $deleted = 0
+    $failed = 0
+    $errors = New-Object System.Collections.Generic.List[string]
+
+    if (-not (Test-Path -LiteralPath $logsDir)) {
+        return [pscustomobject]@{ Deleted = 0; Failed = 0; Errors = @() }
+    }
+
+    $patterns = @(
+        'dgen-generator.*.stdout.log',
+        'dgen-generator.*.stderr.log',
+        'dgen-strategy.*.stdout.log',
+        'dgen-strategy.*.stderr.log',
+        'dgen-strategy.*.try*.stdout.log',
+        'dgen-strategy.*.try*.stderr.log'
+    )
+
+    $files = @()
+    try { $files = @(Get-ChildItem -LiteralPath $logsDir -File -Force -ErrorAction SilentlyContinue) } catch { $files = @() }
+
+    foreach ($f in $files) {
+        if (-not $f) { continue }
+        if ($f.Name -ieq '.gitkeep') { continue }
+
+        $isLegacy = $false
+        foreach ($pat in $patterns) {
+            if ($f.Name -like $pat) { $isLegacy = $true; break }
+        }
+
+        if (-not $isLegacy) {
+            if ($f.Name -ieq 'dgen-strategy.stdout.log' -or $f.Name -ieq 'dgen-strategy.stderr.log') { $isLegacy = $true }
+            if ($f.Name -ieq 'dgen-strategy.stdout.log.prev' -or $f.Name -ieq 'dgen-strategy.stderr.log.prev') { $isLegacy = $true }
+        }
+
+        if (-not $isLegacy) { continue }
+
+        try {
+            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+            $deleted++
+        } catch {
+            $failed++
+            try { $errors.Add(("{0}: {1}" -f $f.Name, $_.Exception.Message)) | Out-Null } catch { }
+        }
+    }
+
+    if (($deleted + $failed) -gt 0) {
+        try { Write-Log ("Logs: cleaned legacy run files: deleted={0} failed={1}" -f $deleted, $failed) } catch { }
+    }
+
+    return [pscustomobject]@{ Deleted = $deleted; Failed = $failed; Errors = $errors.ToArray() }
+}
+
+function Get-Sha256Hex {
+    param([string]$path)
+
+    if (-not $path) { return '' }
+    if (-not (Test-Path -LiteralPath $path)) { return '' }
+
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $fs = [System.IO.File]::OpenRead($path)
+        try {
+            $hash = $sha.ComputeHash($fs)
+        } finally {
+            if ($fs) { $fs.Dispose() }
+            if ($sha) { $sha.Dispose() }
+        }
+
+        return ($hash | ForEach-Object { $_.ToString('x2') }) -join ''
+    } catch {
+        return ''
+    }
+}
+
+function Parse-AutopickFromEngineLogLines {
+    param([string[]]$lines)
+
+    $dnsLine = $null
+    $coreLine = $null
+    $keyLine = $null
+    $scoreHintLine = $null
+    $retuneLine = $null
+
+    foreach ($l in @($lines)) {
+        if (-not $l) { continue }
+        if ($l -like '*autopick: dns FAIL*') { $dnsLine = $l }
+        if ($l -like '*autopick: coreprobes*') { $coreLine = $l }
+        if ($l -like '*autopick: key=*') { $keyLine = $l }
+        if ($l -like '*autopick: score=*') { $scoreHintLine = $l }
+        if ($l -like '*autopick: retune GameFilter=*') { $retuneLine = $l }
+    }
+
+    $autopick = $null
+    if ($keyLine -and ($keyLine -match 'autopick:\s*key=(?<key>\S+)\s+profile=(?<profile>\S+)(?:\s+score=(?<score>-?\d+))?(?:\s+mode=(?<mode>\S+))?')) {
+        $score = $null
+        if ($Matches['score']) { try { $score = [int]$Matches['score'] } catch { $score = $null } }
+        $autopick = [pscustomobject]@{
+            key = $Matches['key']
+            profile = $Matches['profile']
+            score = $score
+            mode = [string]$Matches['mode']
+        }
+    }
+
+    $core = $null
+    if ($coreLine -and ($coreLine -match 'autopick:\s*coreprobes\s+profile=(?<profile>\S+)\s+(?<rest>.*)$')) {
+        $profile = $Matches['profile']
+        $rest = $Matches['rest']
+        $map = @{}
+        foreach ($tok in ($rest -split '\s+')) {
+            if (-not $tok) { continue }
+            if ($tok -match '^(?<k>[a-zA-Z0-9_]+)=(?<v>\S+)$') {
+                $map[$Matches['k']] = $Matches['v']
+            }
+        }
+        $core = [pscustomobject]@{ profile = $profile; results = $map }
+    }
+
+    $blockClass = ''
+    $blockReason = ''
+    $allText = (($dnsLine, $coreLine, $keyLine, $scoreHintLine) | Where-Object { $_ }) -join ' '
+    if ($allText -match 'NAME_NOT_RESOLVED') {
+        $blockClass = 'DNS'
+        $blockReason = 'NAME_NOT_RESOLVED'
+    } elseif ($allText -match 'SECURE_FAILURE|CERT|TLS') {
+        $blockClass = 'TLS'
+        $blockReason = 'SECURE_FAILURE/CERT/TLS'
+    } elseif ($allText -match 'CANNOT_CONNECT|TIMEOUT|CONNECTION|RESET|REFUSED') {
+        $blockClass = 'CONNECT'
+        $blockReason = 'connect/timeout'
+    }
+
+    $autotune = [pscustomobject]@{ retuned = $false; gameFilter = '' }
+    if ($retuneLine) {
+        $gf = ''
+        if ($retuneLine -match 'GameFilter=(?<gf>\S+)') { $gf = [string]$Matches['gf'] }
+        $autotune = [pscustomobject]@{ retuned = $true; gameFilter = $gf }
+    }
+
+    return [pscustomobject]@{
+        Autopick = $autopick
+        Coreprobes = $core
+        Autotune = $autotune
+        BlockClass = $blockClass
+        BlockReason = $blockReason
+        DnsFailLine = $dnsLine
+        CoreprobesLine = $coreLine
+        KeyLine = $keyLine
+        ScoreHintLine = $scoreHintLine
+        RetuneLine = $retuneLine
+    }
+}
+
+function Write-DGenSummaryJson {
+    param([string]$engineLogPath)
+
+    if (-not $engineLogPath) { $engineLogPath = $script:strategyErrPath }
+    if (-not $engineLogPath) { return }
+    if (-not (Test-Path -LiteralPath $engineLogPath)) { return }
+
+    $lines = @()
+    try { $lines = @(Get-Content -LiteralPath $engineLogPath -Tail 600 -Encoding UTF8 -ErrorAction Stop) } catch { $lines = @() }
+    $parsed = Parse-AutopickFromEngineLogLines -lines $lines
+
+    $engineExe = Join-Path (Join-Path $root 'bin') 'DGen.exe'
+    $sha256 = Get-Sha256Hex -path $engineExe
+
+    $strategyRel = ''
+    try { if ($cfg -and ($cfg.PSObject.Properties.Name -contains 'strategy')) { $strategyRel = [string]$cfg.strategy } } catch { $strategyRel = '' }
+
+    $strategyName = ''
+    try { if ($script:currentStrategyFile) { $strategyName = [string]$script:currentStrategyFile.Name } } catch { $strategyName = '' }
+
+    $obj = [ordered]@{
+        schema = 1
+        generatedAt = (Get-Date).ToString('o')
+        runId = $script:runId
+        networkProfileKey = $script:networkProfileKey
+        strategy = [ordered]@{
+            configured = $strategyRel
+            file = $strategyName
+        }
+        engine = [ordered]@{
+            exe = $engineExe
+            sha256 = $sha256
+        }
+        logs = [ordered]@{
+            launcher = $script:activeLogPath
+            generatorStdout = $script:generatorOutPath
+            generatorStderr = $script:generatorErrPath
+            engineStdout = $script:strategyOutPath
+            engineLog = $engineLogPath
+        }
+        autopick = $parsed.Autopick
+        coreprobes = $parsed.Coreprobes
+        autotune = $parsed.Autotune
+        gameFilterOverride = $script:gameFilterOverride
+        blockClass = $parsed.BlockClass
+        blockReason = $parsed.BlockReason
+        raw = [ordered]@{
+            dnsFailLine = $parsed.DnsFailLine
+            coreprobesLine = $parsed.CoreprobesLine
+            keyLine = $parsed.KeyLine
+            scoreHintLine = $parsed.ScoreHintLine
+            retuneLine = $parsed.RetuneLine
+        }
+    }
+
+    $json = $obj | ConvertTo-Json -Depth 10
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+    try {
+        if (Test-Path -LiteralPath $defaultSummaryPath) {
+            Copy-Item -Force -LiteralPath $defaultSummaryPath -Destination ($defaultSummaryPath + '.prev')
+        }
+    } catch { }
+
+    try { [System.IO.File]::WriteAllText($defaultSummaryPath, $json, $utf8NoBom) } catch { }
+}
+
+function Update-DGenSummaryJsonIfNeeded {
+    try {
+        $src = $script:strategyErrPath
+        if (-not $src) { return }
+        if (-not (Test-Path -LiteralPath $src)) { return }
+
+        $fi = $null
+        try { $fi = Get-Item -LiteralPath $src -ErrorAction Stop } catch { $fi = $null }
+        if (-not $fi) { return }
+
+        $run = [string]$script:runId
+        if (-not $run) { $run = '' }
+
+        if ($script:lastSummaryRunId -eq $run -and $script:lastSummarySourcePath -eq $fi.FullName -and $script:lastSummarySourceWriteUtc -eq $fi.LastWriteTimeUtc) {
+            return
+        }
+
+        $script:lastSummaryRunId = $run
+        $script:lastSummarySourcePath = $fi.FullName
+        $script:lastSummarySourceWriteUtc = $fi.LastWriteTimeUtc
+
+        Write-DGenSummaryJson -engineLogPath $fi.FullName
+    } catch { }
 }
 
 function Delete-LogFiles {
@@ -1143,10 +1399,19 @@ function Run-Generator {
         [string]$runId
     )
 
-    if (-not $runId) { throw "runId is required for generator logs." }
+    $script:generatorOutPath = $defaultGeneratorOutPath
+    $script:generatorErrPath = $defaultGeneratorErrPath
 
-    $script:generatorOutPath = Join-Path $logsDir "dgen-generator.$runId.stdout.log"
-    $script:generatorErrPath = Join-Path $logsDir "dgen-generator.$runId.stderr.log"
+    try {
+        if (Test-Path -LiteralPath $script:generatorOutPath) {
+            Copy-Item -Force -LiteralPath $script:generatorOutPath -Destination ($script:generatorOutPath + '.prev')
+        }
+    } catch { }
+    try {
+        if (Test-Path -LiteralPath $script:generatorErrPath) {
+            Copy-Item -Force -LiteralPath $script:generatorErrPath -Destination ($script:generatorErrPath + '.prev')
+        }
+    } catch { }
 
     New-Item -ItemType File -Path $script:generatorOutPath -Force | Out-Null
     New-Item -ItemType File -Path $script:generatorErrPath -Force | Out-Null
@@ -1509,13 +1774,23 @@ function Start-StrategyFile {
         [string]$runId
     )
 
-    if (-not $runId) { throw "runId is required for strategy logs." }
-
     $attemptTag = ("{0:D4}" -f [int]$script:strategyAttemptSeq)
     $script:strategyAttemptSeq++
 
-    $script:strategyOutPath = Join-Path $logsDir ("dgen-strategy.{0}.try{1}.stdout.log" -f $runId, $attemptTag)
-    $script:strategyErrPath = Join-Path $logsDir ("dgen-strategy.{0}.try{1}.stderr.log" -f $runId, $attemptTag)
+    # Consolidate logs: keep only a few stable files.
+    $script:strategyOutPath = $defaultStrategyOutPath
+    $script:strategyErrPath = $defaultStrategyErrPath
+
+    try {
+        if (Test-Path -LiteralPath $script:strategyOutPath) {
+            Copy-Item -Force -LiteralPath $script:strategyOutPath -Destination ($script:strategyOutPath + '.prev')
+        }
+    } catch { }
+    try {
+        if (Test-Path -LiteralPath $script:strategyErrPath) {
+            Copy-Item -Force -LiteralPath $script:strategyErrPath -Destination ($script:strategyErrPath + '.prev')
+        }
+    } catch { }
 
     New-Item -ItemType File -Path $script:strategyOutPath -Force | Out-Null
     New-Item -ItemType File -Path $script:strategyErrPath -Force | Out-Null
@@ -2433,6 +2708,116 @@ $script:generatorOutPath = $defaultGeneratorOutPath
 $script:generatorErrPath = $defaultGeneratorErrPath
 $script:strategyOutPath = $defaultStrategyOutPath
 $script:strategyErrPath = $defaultStrategyErrPath
+
+# Roblox auto-retry (fast, non-blocking): after Start, watch Roblox logs briefly; if we see 279/529,
+# restart DGen once with wide GameFilter to avoid requiring a manual second Start.
+$script:robloxAutoRetryEnabled = $false
+$script:robloxAutoRetryUntil = $null
+$script:robloxAutoRetryNextCheckAt = $null
+$script:robloxAutoRetryTriggered = $false
+$script:robloxAutoRetryStartedAt = $null
+
+function Test-WantsRoblox {
+    try {
+        if (-not $cfg) { return $false }
+        if (-not ($cfg.PSObject.Properties.Name -contains 'domains')) { return $false }
+        if (-not $cfg.domains) { return $false }
+        foreach ($d in @($cfg.domains)) {
+            $t = ([string]$d).ToLower().Trim()
+            if (-not $t) { continue }
+            if ($t -eq 'roblox.com' -or $t.EndsWith('.roblox.com') -or $t -eq 'rbxcdn.com' -or $t.EndsWith('.rbxcdn.com') -or $t -eq 'robloxapis.com' -or $t.EndsWith('.robloxapis.com')) {
+                return $true
+            }
+        }
+    } catch { }
+    return $false
+}
+
+function Start-RobloxAutoRetryWatcher {
+    # Only watch when Roblox is a requested domain and we are NOT already in wide GameFilter mode.
+    $script:robloxAutoRetryEnabled = $false
+    $script:robloxAutoRetryTriggered = $false
+    $script:robloxAutoRetryUntil = $null
+    $script:robloxAutoRetryNextCheckAt = $null
+    $script:robloxAutoRetryStartedAt = $null
+
+    try {
+        if (-not (Test-WantsRoblox)) { return }
+        if ($script:gameFilterOverride) { return }
+        if ($script:autoTunedGameFilter) { return }
+
+        $script:robloxAutoRetryEnabled = $true
+        $script:robloxAutoRetryStartedAt = Get-Date
+        $script:robloxAutoRetryUntil = (Get-Date).AddSeconds(60)
+        $script:robloxAutoRetryNextCheckAt = (Get-Date)
+        Write-Log "Roblox auto-retry: watcher armed (60s window)"
+    } catch { }
+}
+
+function Tick-RobloxAutoRetry {
+    if (-not $script:robloxAutoRetryEnabled) { return }
+    if ($script:robloxAutoRetryTriggered) { return }
+    if (-not $script:robloxAutoRetryUntil) { return }
+    if ((Get-Date) -ge $script:robloxAutoRetryUntil) {
+        $script:robloxAutoRetryEnabled = $false
+        return
+    }
+
+    if ($script:robloxAutoRetryNextCheckAt -and (Get-Date) -lt $script:robloxAutoRetryNextCheckAt) { return }
+    $script:robloxAutoRetryNextCheckAt = (Get-Date).AddSeconds(5)
+
+    # If user already enabled wide ports during this run, stop watching.
+    if ($script:gameFilterOverride -or $script:autoTunedGameFilter) {
+        $script:robloxAutoRetryEnabled = $false
+        return
+    }
+
+    # Avoid reacting to ancient 279/529 entries: only consider logs that were written after we armed the watcher.
+    try {
+        if ($script:robloxAutoRetryStartedAt) {
+            $logDir = Get-RobloxLogDir
+            if (-not $logDir) { return }
+            $latest = @(Get-ChildItem -LiteralPath $logDir -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+            if (-not $latest -or $latest.Count -eq 0) { return }
+            if ($latest[0].LastWriteTime -lt $script:robloxAutoRetryStartedAt) { return }
+        }
+    } catch { }
+
+    try {
+        $rob = Get-RobloxEndpointsFromRecentLogs -tailLines 800
+        if (-not $rob) { return }
+
+        $needWidePorts = $false
+        try { if ($rob.PSObject.Properties.Name -contains 'Has279' -and $rob.Has279) { $needWidePorts = $true } } catch { }
+        try { if ($rob.PSObject.Properties.Name -contains 'Has529' -and $rob.Has529) { $needWidePorts = $true } } catch { }
+
+        if (-not $needWidePorts) { return }
+
+        $script:robloxAutoRetryTriggered = $true
+        $script:robloxAutoRetryEnabled = $false
+        $script:autoTunedGameFilter = $true
+        $script:gameFilterOverride = '1024-65535'
+        Write-Log "Roblox auto-retry: detected 279/529; restarting with GameFilter=1024-65535"
+
+        # Fast restart: stop current DGen and immediately start the same strategy with new env.
+        Stop-All
+        Stop-Winws
+        Stop-WinDivertServices -waitMs 5000 | Out-Null
+
+        if (-not $script:currentStrategyFile) { return }
+        $script:runId = New-RunId
+        Write-Log "New run: $($script:runId)"
+        $script:strategyRunnerProc = Start-StrategyFile -strategyFile $script:currentStrategyFile -attemptIndex 0 -runId $script:runId
+        $script:waitUntil = (Get-Date).AddSeconds(2)
+        $script:winwsStartDeadline = (Get-Date).AddMilliseconds(15000)
+        $script:startState = "Starting"
+        Update-ToggleButton
+        Refresh-Logs
+    } catch {
+        # Never break the session on watcher issues.
+        try { Write-Log "Roblox auto-retry: watcher error: $($_.Exception.Message)" } catch { }
+    }
+}
 $script:generatorProc = $null
 $script:strategies = @()
 $script:strategyIndex = 0
@@ -2567,6 +2952,15 @@ function Tick-StartState {
             $script:waitUntil = $null
             $script:winwsStartDeadline = $null
             try { Hide-LoadingOverlay } catch { }
+
+            # Fast Roblox auto-retry (does NOT block start): if Roblox later reports 279/529,
+            # we will restart once with wide GameFilter.
+            Start-RobloxAutoRetryWatcher
+            return
+        }
+
+        if ($script:startState -eq "Running") {
+            Tick-RobloxAutoRetry
             return
         }
     } catch {
@@ -2646,6 +3040,7 @@ $toggleBtn.Add_Click({
             $script:postStartRobloxRetried = $false
             $script:activeLogPath = $logPath
             try { Clear-CurrentLogs } catch { }
+            try { Cleanup-LegacyRunLogs } catch { }
 
             try { if ($mainTabs -and $logsTab) { $mainTabs.SelectedTab = $logsTab } } catch { }
 
@@ -2916,6 +3311,7 @@ $timer.Add_Tick({
     try {
         Refresh-Views
         Refresh-Logs
+        Update-DGenSummaryJsonIfNeeded
         Tick-StartState
     } finally {
         try { $script:uiBusy = $false } catch { }
