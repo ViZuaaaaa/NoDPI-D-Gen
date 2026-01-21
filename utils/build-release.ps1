@@ -88,7 +88,21 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 $dstBin = Join-Path $stage 'bin'
 New-Item -ItemType Directory -Path $dstBin -Force | Out-Null
-Copy-Item -Path (Join-Path $BinSource '*') -Destination $dstBin -Recurse -Force
+
+# Copy BinSource payload but exclude developer backup artifacts like DGen.exe.bak-*
+$binSourceItems = Get-ChildItem -LiteralPath $BinSource -Force
+foreach ($item in $binSourceItems) {
+    if ($item.Name -like 'DGen.exe.bak*') {
+        continue
+    }
+    Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $dstBin $item.Name) -Recurse -Force
+}
+
+# Fail-fast: ensure no backup artifacts slipped into the release bin
+$bakItems = @(Get-ChildItem -LiteralPath $dstBin -Filter 'DGen.exe.bak*' -File -ErrorAction SilentlyContinue)
+if ($bakItems.Count -gt 0) {
+    throw ("Release bin contains backup artifacts: {0}" -f (($bakItems | Select-Object -ExpandProperty Name) -join ', '))
+}
 
 # 4) Don't ship machine-local autopick cache/state
 $autopickState = Join-Path $dstBin 'dgen-autopick.state'

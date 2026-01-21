@@ -10,10 +10,20 @@
       "priority": 100,
       "tags": ["baseline", "discord", "youtube", "roblox"]
     },
+    "general (CLASSIC).bat": {
+      "enabled": true,
+      "priority": 99,
+      "tags": ["classic", "no_fake_tls", "discord", "youtube", "roblox", "ethernet"]
+    },
     "general (ALT11).bat": {
       "enabled": true,
       "priority": 95,
       "tags": ["alt", "heavy", "discord", "roblox"]
+    },
+    "general (FAKE TLS AUTO SYNDATA STRICT).bat": {
+      "enabled": true,
+      "priority": 94,
+      "tags": ["syndata", "strict", "ethernet", "discord", "roblox"]
     },
     "general (FAKE TLS AUTO ALT3).bat": {
       "enabled": true,
@@ -34,6 +44,11 @@
       "enabled": true,
       "priority": 80,
       "tags": ["fake_tls_auto", "discord", "youtube", "roblox"]
+    },
+    "general (FAKE TLS AUTO SYNDATA).bat": {
+      "enabled": true,
+      "priority": 79,
+      "tags": ["syndata", "ethernet", "discord", "roblox"]
     }
   }
 }

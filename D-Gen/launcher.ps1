@@ -319,6 +319,7 @@ function Write-DGenSummaryJson {
         generatedAt = (Get-Date).ToString('o')
         runId = $script:runId
         networkProfileKey = $script:networkProfileKey
+        linkType = $script:networkLinkType
         strategy = [ordered]@{
             configured = $strategyRel
             file = $strategyName
@@ -354,7 +355,24 @@ function Write-DGenSummaryJson {
 
     try {
         if (Test-Path -LiteralPath $defaultSummaryPath) {
-            Copy-Item -Force -LiteralPath $defaultSummaryPath -Destination ($defaultSummaryPath + '.prev')
+            # Preserve the last *informative* summary in .prev.
+            # When Ethernet auto-rotate starts fixed-profile strategies, their summaries don't include autopick/coreprobes,
+            # so we must not overwrite a previous autopick/coreprobes-rich summary with a null one.
+            $copyPrev = $false
+            try {
+                $prevText = Get-Content -LiteralPath $defaultSummaryPath -Raw -ErrorAction SilentlyContinue
+                if ($prevText) {
+                    $prevObj = $prevText | ConvertFrom-Json -ErrorAction Stop
+                    if ($prevObj) {
+                        if (($prevObj.PSObject.Properties.Name -contains 'autopick') -and $prevObj.autopick) { $copyPrev = $true }
+                        if (($prevObj.PSObject.Properties.Name -contains 'coreprobes') -and $prevObj.coreprobes) { $copyPrev = $true }
+                    }
+                }
+            } catch { $copyPrev = $false }
+
+            if ($copyPrev) {
+                Copy-Item -Force -LiteralPath $defaultSummaryPath -Destination ($defaultSummaryPath + '.prev')
+            }
         }
     } catch { }
 
@@ -722,9 +740,17 @@ function Get-RobloxEndpointsFromRecentLogs {
         try { $lines = Get-Content -LiteralPath $f.FullName -Tail $tailLines -Encoding UTF8 -ErrorAction Stop } catch { continue }
 
         foreach ($line in $lines) {
-            if (-not $rxBad.IsMatch($line)) { continue }
+            $bad = $false
+            try { $bad = $rxBad.IsMatch($line) } catch { $bad = $false }
 
-            if (-not $sample) {
+            # Even when a line doesn't contain a keyword like "timeout", Roblox logs can still print
+            # the actual game server IP. Capture those too.
+            $ipLine = $false
+            try { $ipLine = $rxIPv4.IsMatch($line) -or $rxIPv6.IsMatch($line) } catch { $ipLine = $false }
+
+            if (-not $bad -and -not $ipLine) { continue }
+
+            if ($bad -and -not $sample) {
                 $sample = if ($line.Length -gt 220) { $line.Substring(0, 220) + '...' } else { $line }
             }
 
@@ -1024,6 +1050,66 @@ function Filter-LauncherLogForUi {
     if (-not $text) { return $text }
 
     $lines = $text -split "`r?`n"
+
+    # UX: make logs "start" only when the session is actually ready.
+    # Prefer the concise readiness marker we print at the end of Start.
+    $readyIdx = -1
+    for ($i = 0; $i -lt $lines.Length; $i++) {
+        $l = $lines[$i]
+        if ($l -and ($l -match '\bDGen\s+RUN:')) { $readyIdx = $i; break }
+    }
+    if ($readyIdx -lt 0) {
+        for ($i = 0; $i -lt $lines.Length; $i++) {
+            $l = $lines[$i]
+            if ($l -and ($l -match '\bREADY:')) { $readyIdx = $i; break }
+        }
+    }
+    if ($readyIdx -ge 0) {
+        $lines = $lines[$readyIdx..($lines.Length - 1)]
+    }
+
+    # User UX: normally show exactly ONE readiness line in the UI,
+    # but always surface Stop / auto-rotate / auto-retry lines so the user can see progress.
+    $runLine = $null
+    $important = New-Object System.Collections.Generic.List[string]
+
+    foreach ($line in $lines) {
+        if (-not $line) { continue }
+
+        if ($line -match '\bDGen\s+RUN:') {
+            $runLine = $line
+            continue
+        }
+
+        $msg = $line
+        $parts = $line -split '\s\|\s', 2
+        if ($parts.Count -eq 2) { $msg = $parts[1] }
+
+        # Hide high-frequency progress spam; keep summaries/errors.
+        if ($msg -like 'Preflight: checking *') { continue }
+
+        if (
+            $msg -eq 'Stop requested' -or
+            $msg -like 'Stop-All:*' -or
+            $msg -like 'Ethernet auto-rotate:*' -or
+            $msg -like 'Roblox auto-retry:*' -or
+            $msg -like 'FATAL:*' -or
+            $msg -like 'ERROR:*' -or
+            $msg -like 'Start failed*' -or
+            $msg -like 'Fail-*'
+        ) {
+            $important.Add($line) | Out-Null
+            continue
+        }
+    }
+
+    if ($runLine -and $important.Count -gt 0) {
+        $recent = @($important | Select-Object -Last 8)
+        return (($recent + $runLine) -join "`r`n")
+    }
+
+    if ($runLine) { return $runLine }
+
     $out = New-Object System.Collections.Generic.List[string]
 
     foreach ($line in $lines) {
@@ -1160,6 +1246,47 @@ function New-DefaultBotStateFile {
 
 function Get-NetworkProfileKey {
     try {
+        $script:networkLinkType = 'unknown'
+        $script:networkIfIndex = $null
+        $script:networkIfGuid = ''
+        $script:networkIfAlias = ''
+        $script:networkMtu = $null
+
+        $activeIfIndex = $null
+        try {
+            $routes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' })
+            if ($routes.Count -gt 0) {
+                foreach ($r in $routes) {
+                    $ifMetric = 9999
+                    try {
+                        $ipif = Get-NetIPInterface -InterfaceIndex $r.InterfaceIndex -AddressFamily IPv4 -ErrorAction Stop
+                        if ($ipif) { $ifMetric = [int]$ipif.InterfaceMetric }
+                    } catch { $ifMetric = 9999 }
+                    try { $r | Add-Member -NotePropertyName _ifMetric -NotePropertyValue $ifMetric -Force } catch { }
+                }
+
+                $best = $routes | Sort-Object RouteMetric, _ifMetric, InterfaceIndex | Select-Object -First 1
+                $activeIfIndex = [int]$best.InterfaceIndex
+            }
+        } catch {
+            $activeIfIndex = $null
+        }
+
+        if ($activeIfIndex -ne $null) {
+            try { $script:networkIfIndex = [int]$activeIfIndex } catch { $script:networkIfIndex = $null }
+            try {
+                $na = Get-NetAdapter -InterfaceIndex $activeIfIndex -ErrorAction Stop | Select-Object -First 1
+                if ($na) {
+                    $script:networkIfGuid = [string]$na.InterfaceGuid
+                    $script:networkIfAlias = [string]$na.Name
+                }
+            } catch { }
+            try {
+                $ipif = Get-NetIPInterface -InterfaceIndex $activeIfIndex -AddressFamily IPv4 -ErrorAction Stop | Select-Object -First 1
+                if ($ipif) { $script:networkMtu = [int]$ipif.NlMtu }
+            } catch { }
+        }
+
         $dns = New-Object System.Collections.Generic.List[string]
         $gw = New-Object System.Collections.Generic.List[string]
         $ipPrefixes = New-Object System.Collections.Generic.List[string]
@@ -1172,6 +1299,20 @@ function Get-NetworkProfileKey {
             $ipProps = $null
             try { $ipProps = $ni.GetIPProperties() } catch { continue }
             if (-not $ipProps) { continue }
+
+            $ifIndex = $null
+            try { $ifIndex = [int]($ipProps.GetIPv4Properties().Index) } catch { $ifIndex = $null }
+            if ($activeIfIndex -ne $null -and $ifIndex -ne $activeIfIndex) { continue }
+
+            if ($script:networkLinkType -eq 'unknown') {
+                try {
+                    if ($ni.NetworkInterfaceType -eq [System.Net.NetworkInformation.NetworkInterfaceType]::Wireless80211) {
+                        $script:networkLinkType = 'wifi'
+                    } elseif ($ni.NetworkInterfaceType -eq [System.Net.NetworkInformation.NetworkInterfaceType]::Ethernet) {
+                        $script:networkLinkType = 'ethernet'
+                    }
+                } catch { }
+            }
 
             foreach ($a in @($ipProps.DnsAddresses)) {
                 try {
@@ -1212,8 +1353,23 @@ function Get-NetworkProfileKey {
         $gwKey = (@($gw | Where-Object { $_ } | Sort-Object -Unique) -join ',')
         $ipKey = (@($ipPrefixes | Where-Object { $_ } | Sort-Object -Unique) -join ',')
         $dhcpKey = (@($dhcp | Where-Object { $_ } | Sort-Object -Unique) -join ',')
-        $raw = ("dns={0}|gw={1}|ip={2}|dhcp={3}" -f $dnsKey, $gwKey, $ipKey, $dhcpKey)
-        if (-not $dnsKey -and -not $gwKey -and -not $ipKey -and -not $dhcpKey) { $raw = 'none' }
+
+        $ifGuid = ''
+        $ifAlias = ''
+        $ifIndex = ''
+        $mtu = ''
+        try { if ($script:networkIfGuid) { $ifGuid = [string]$script:networkIfGuid } } catch { $ifGuid = '' }
+        try { if ($script:networkIfAlias) { $ifAlias = [string]$script:networkIfAlias } } catch { $ifAlias = '' }
+        try { if ($script:networkIfIndex -ne $null) { $ifIndex = [string]$script:networkIfIndex } } catch { $ifIndex = '' }
+        try { if ($script:networkMtu -ne $null) { $mtu = [string]$script:networkMtu } } catch { $mtu = '' }
+
+        $ifGuid = $ifGuid.Replace('|', '/').Replace('"', '').Trim()
+        $ifAlias = $ifAlias.Replace('|', '/').Replace('"', '').Trim()
+        $ifIndex = $ifIndex.Replace('|', '/').Replace('"', '').Trim()
+        $mtu = $mtu.Replace('|', '/').Replace('"', '').Trim()
+
+        $raw = ("ifIndex={0}|ifGuid={1}|ifAlias={2}|mtu={3}|link={4}|dns={5}|gw={6}|ip={7}|dhcp={8}" -f $ifIndex, $ifGuid, $ifAlias, $mtu, $script:networkLinkType, $dnsKey, $gwKey, $ipKey, $dhcpKey)
+        if (-not $dnsKey -and -not $gwKey -and -not $ipKey -and -not $dhcpKey) { $raw = ("none|ifIndex={0}|ifGuid={1}|ifAlias={2}|mtu={3}|link={4}" -f $ifIndex, $ifGuid, $ifAlias, $mtu, $script:networkLinkType) }
 
         $sha = [System.Security.Cryptography.SHA256]::Create()
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
@@ -1933,12 +2089,18 @@ function Start-StrategyFile {
 
     try {
         if (Test-Path -LiteralPath $script:strategyOutPath) {
-            Copy-Item -Force -LiteralPath $script:strategyOutPath -Destination ($script:strategyOutPath + '.prev')
+            $fi = Get-Item -LiteralPath $script:strategyOutPath -ErrorAction SilentlyContinue
+            if ($fi -and $fi.Length -gt 0) {
+                Copy-Item -Force -LiteralPath $script:strategyOutPath -Destination ($script:strategyOutPath + '.prev')
+            }
         }
     } catch { }
     try {
         if (Test-Path -LiteralPath $script:strategyErrPath) {
-            Copy-Item -Force -LiteralPath $script:strategyErrPath -Destination ($script:strategyErrPath + '.prev')
+            $fi = Get-Item -LiteralPath $script:strategyErrPath -ErrorAction SilentlyContinue
+            if ($fi -and $fi.Length -gt 0) {
+                Copy-Item -Force -LiteralPath $script:strategyErrPath -Destination ($script:strategyErrPath + '.prev')
+            }
         }
     } catch { }
 
@@ -1962,6 +2124,26 @@ function Start-StrategyFile {
     if (-not $botKey) { $botKey = 'unknown' }
     $botKey = ([string]$botKey).Replace('"', '')
     $cmdParts += ('set "DGEN_NET_PROFILE={0}"' -f $botKey)
+
+    $link = ''
+    try { $link = [string]$script:networkLinkType } catch { $link = '' }
+    if (-not $link) { $link = 'unknown' }
+    $link = $link.Replace('"', '')
+    $cmdParts += ('set "DGEN_LINK_TYPE={0}"' -f $link)
+
+    $ifIndex = $null
+    try { $ifIndex = $script:networkIfIndex } catch { $ifIndex = $null }
+    if ($ifIndex -ne $null) {
+        $cmdParts += ('set "DGEN_IF_INDEX={0}"' -f [string]$ifIndex)
+    }
+
+    $mtu = ''
+    try { if ($script:networkMtu -ne $null) { $mtu = [string]$script:networkMtu } } catch { $mtu = '' }
+    if ($mtu) {
+        $mtu = $mtu.Replace('"', '')
+        $cmdParts += ('set "DGEN_MTU={0}"' -f $mtu)
+    }
+
     $cmdParts += 'set "DGEN_AUTOPICK_SAVE=1"'
 
     $cmdParts += 'set "DGEN_SKIP_UPDATE_CHECK=1"'
@@ -2070,6 +2252,18 @@ function Stop-All {
 
     Stop-Winws
 
+    # Verify we didn't leave any DGen.exe behind (taskkill can race with process teardown on some systems).
+    try {
+        Start-Sleep -Milliseconds 200
+        $pidsAfter = @(Get-Process -Name "DGen" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+        if ($pidsAfter -and $pidsAfter.Count -gt 0) {
+            Write-Log ("Stop-All: DGen still running after stop; pidCount={0}" -f $pidsAfter.Count)
+            foreach ($procId in $pidsAfter) {
+                try { Kill-ProcessTree -processId $procId } catch { }
+            }
+        }
+    } catch { }
+
     # Kill leftover console runners that might outlive the tracked Process objects (cmd/powershell).
     try {
         $rootPath = $root
@@ -2176,6 +2370,12 @@ function Refresh-Views {
 }
 
 function Refresh-Logs {
+    # UX: while we're still starting (generator/autopick), keep the UI log view empty.
+    # We'll show a clear READY marker and start updating logs only after capture is started.
+    if ($script:startState -and $script:startState -ne "Idle" -and $script:startState -ne "Running") {
+        return
+    }
+
     if ($launcherLogBox -and (Can-OverwriteTextBox $launcherLogBox)) {
         $launcherText = Read-LogTail -path $script:activeLogPath
         $launcherText = Filter-LauncherLogForUi -text $launcherText
@@ -2708,9 +2908,22 @@ $script:loadingOverlay.Add_Paint({
             $g.DrawLine($script:loadingPenDevil, $headCx, $neckY, $headCx, $hipY)
 
             $armY = [int]($devY + ($devH * 0.40))
-            $handX = $headCx + 18
-            $handY = $armY + 6
+            $armDx = [int](-4 * $s)
+            $armDy = [int](2 * $s)
+
+            # Right arm (pitchfork)
+            $handX = $headCx + 18 + $armDx
+            $handY = $armY + 6 + $armDy
             $g.DrawLine($script:loadingPenDevil, $headCx, $armY, $handX, $handY)
+
+            # Left arm (free hand)
+            $freeHandX = $headCx - 18 - $armDx
+            $freeHandY = $armY + 6 - $armDy
+            $g.DrawLine($script:loadingPenDevil, $headCx, $armY, $freeHandX, $freeHandY)
+            try {
+                $g.FillEllipse($script:loadingBrushDevil, ($freeHandX - 2), ($freeHandY - 2), 4, 4)
+                $g.DrawEllipse($script:loadingPenDevil, ($freeHandX - 2), ($freeHandY - 2), 4, 4)
+            } catch { }
 
             try {
                 $forkX = $handX + 2
@@ -2738,11 +2951,27 @@ $script:loadingOverlay.Add_Paint({
                 }
             } catch { }
 
+            # Tail (behind the body): curve anchored at hip, sways slightly with the gait.
+            try {
+                $tailBaseX = [single]($headCx - 2)
+                $tailBaseY = [single]($hipY - 2)
+                $tailMidX = [single]($headCx - 16 - [int]($armDx / 2))
+                $tailMidY = [single]($hipY + 6)
+                $tailTipX = [single]($headCx - 34 - $armDx)
+                $tailTipY = [single]($hipY - 10)
+
+                $pts = @(
+                    (New-Object System.Drawing.PointF($tailBaseX, $tailBaseY)),
+                    (New-Object System.Drawing.PointF($tailMidX, $tailMidY)),
+                    (New-Object System.Drawing.PointF($tailTipX, $tailTipY))
+                )
+
+                $g.DrawCurve($script:loadingPenDevil, $pts)
+            } catch { }
+
             $groundY = [int]($devY + $devH)
             $g.DrawLine($script:loadingPenDevil, $headCx, $hipY, $headCx - 10 - $legDx, $groundY)
             $g.DrawLine($script:loadingPenDevil, $headCx, $hipY, $headCx + 4 + $legDx, $groundY)
-
-            $g.DrawArc($script:loadingPenDevil, ($headCx - 18), ($hipY - 6), 26, 26, 20, 180)
         } catch { }
 
         $shadowPath = $null
@@ -2854,6 +3083,7 @@ $script:startState = "Idle"
 $script:uiBusy = $false
 $script:runId = $null
 $script:networkProfileKey = ''
+$script:networkLinkType = ''
 $script:generatorOutPath = $defaultGeneratorOutPath
 $script:generatorErrPath = $defaultGeneratorErrPath
 $script:strategyOutPath = $defaultStrategyOutPath
@@ -2866,6 +3096,7 @@ $script:robloxAutoRetryUntil = $null
 $script:robloxAutoRetryNextCheckAt = $null
 $script:robloxAutoRetryTriggered = $false
 $script:robloxAutoRetryStartedAt = $null
+$script:robloxAutoRetryHadWideGameFilter = $false
 
 function Test-WantsRoblox {
     try {
@@ -2890,17 +3121,21 @@ function Start-RobloxAutoRetryWatcher {
     $script:robloxAutoRetryUntil = $null
     $script:robloxAutoRetryNextCheckAt = $null
     $script:robloxAutoRetryStartedAt = $null
+    $script:robloxAutoRetryHadWideGameFilter = $false
 
     try {
         if (-not (Test-WantsRoblox)) { return }
-        if ($script:gameFilterOverride) { return }
         if ($script:autoTunedGameFilter) { return }
+
+        # Even if GameFilterOverride is already enabled (e.g., from previous 279 logs),
+        # still watch for *new* 279/529 so we can ingest fresh server IPs and restart once.
+        try { if ($script:gameFilterOverride) { $script:robloxAutoRetryHadWideGameFilter = $true } } catch { $script:robloxAutoRetryHadWideGameFilter = $false }
 
         $script:robloxAutoRetryEnabled = $true
         $script:robloxAutoRetryStartedAt = Get-Date
-        $script:robloxAutoRetryUntil = (Get-Date).AddSeconds(60)
+        $script:robloxAutoRetryUntil = (Get-Date).AddMinutes(10)
         $script:robloxAutoRetryNextCheckAt = (Get-Date)
-        Write-Log "Roblox auto-retry: watcher armed (60s window)"
+        Write-Log "Roblox auto-retry: watcher armed (10min window)"
     } catch { }
 }
 
@@ -2934,7 +3169,7 @@ function Tick-RobloxAutoRetry {
     } catch { }
 
     try {
-        $rob = Get-RobloxEndpointsFromRecentLogs -tailLines 800
+        $rob = Get-RobloxEndpointsFromRecentLogs -tailLines 2500
         if (-not $rob) { return }
 
         $needWidePorts = $false
@@ -2943,11 +3178,35 @@ function Tick-RobloxAutoRetry {
 
         if (-not $needWidePorts) { return }
 
+        $hosts = @()
+        $ips = @()
+        try { if ($rob.PSObject.Properties.Name -contains 'Hosts') { $hosts = @($rob.Hosts) } } catch { $hosts = @() }
+        try { if ($rob.PSObject.Properties.Name -contains 'Ips') { $ips = @($rob.Ips) } } catch { $ips = @() }
+
+        $addedIps = 0
+        try {
+            if ($ips.Count -gt 0) {
+                $addedIps += Update-IpsetAllFromIps -ips $ips
+            }
+            if ($addedIps -eq 0 -and $hosts.Count -gt 0) {
+                # DNS fallback if logs don't contain server IPs.
+                $addedIps += Update-IpsetAllFromHosts -hosts $hosts
+            }
+        } catch { }
+
         $script:robloxAutoRetryTriggered = $true
         $script:robloxAutoRetryEnabled = $false
         $script:autoTunedGameFilter = $true
-        $script:gameFilterOverride = '1024-65535'
-        Write-Log "Roblox auto-retry: detected 279/529; restarting with GameFilter=1024-65535"
+
+        $hadWide = $false
+        try { if ($script:gameFilterOverride) { $hadWide = $true } } catch { $hadWide = $false }
+
+        if (-not $hadWide) {
+            $script:gameFilterOverride = '1024-65535'
+            Write-Log ("Roblox auto-retry: detected 279/529; ipsFound={0} addedIps={1}; enabling GameFilter=1024-65535 and restarting" -f $ips.Count, $addedIps)
+        } else {
+            Write-Log ("Roblox auto-retry: detected 279/529; ipsFound={0} addedIps={1}; restarting to apply ipset updates" -f $ips.Count, $addedIps)
+        }
 
         # Fast restart: stop current DGen and immediately start the same strategy with new env.
         Stop-All
@@ -2960,6 +3219,7 @@ function Tick-RobloxAutoRetry {
         $script:strategyRunnerProc = Start-StrategyFile -strategyFile $script:currentStrategyFile -attemptIndex 0 -runId $script:runId
         $script:waitUntil = (Get-Date).AddSeconds(2)
         $script:winwsStartDeadline = (Get-Date).AddMilliseconds(15000)
+        $script:captureStartDeadline = (Get-Date).AddSeconds(60)
         $script:startState = "Starting"
         Update-ToggleButton
         Refresh-Logs
@@ -2968,6 +3228,333 @@ function Tick-RobloxAutoRetry {
         try { Write-Log "Roblox auto-retry: watcher error: $($_.Exception.Message)" } catch { }
     }
 }
+
+# Ethernet auto-rotate (fast, minimal logs): after Start on Ethernet, run short HTTPS probes.
+# If Discord+Roblox are both dead but control (YouTube) is alive, automatically restart with the next strategy.
+$script:ethernetAutoRotateEnabled = $false
+$script:ethernetAutoRotateTriggered = $false
+$script:ethernetAutoRotateUntil = $null
+$script:ethernetAutoRotateNextCheckAt = $null
+$script:ethernetAutoRotateStartedAt = $null
+$script:ethernetAutoRotateAttempt = 0
+$script:ethernetAutoRotateMaxAttempts = 6
+$script:ethernetAutoRotateQueue = @()
+$script:ethernetAutoRotateQueueIndex = 0
+$script:ethernetAutoRotateLastProbe = $null
+$script:ethernetAutoRotateLastGoodStrategyFile = $null
+
+function Reset-EthernetAutoRotateState {
+    $script:ethernetAutoRotateEnabled = $false
+    $script:ethernetAutoRotateTriggered = $false
+    $script:ethernetAutoRotateUntil = $null
+    $script:ethernetAutoRotateNextCheckAt = $null
+    $script:ethernetAutoRotateStartedAt = $null
+    $script:ethernetAutoRotateAttempt = 0
+    $script:ethernetAutoRotateQueue = @()
+    $script:ethernetAutoRotateQueueIndex = 0
+    $script:ethernetAutoRotateLastProbe = $null
+    $script:ethernetAutoRotateLastGoodStrategyFile = $null
+}
+
+function Test-IsEthernetLink {
+    try {
+        $t = [string]$script:networkLinkType
+        if (-not $t) { return $false }
+        return ($t.Trim().ToLowerInvariant() -eq 'ethernet')
+    } catch { return $false }
+}
+
+function Invoke-PostStartProbes {
+    param([int]$timeoutMs = 2000)
+
+    $discordUrls = @(
+        'https://discord.com/app',
+        'https://gateway.discord.gg',
+        'https://dl.discordapp.net/'
+    )
+    $robloxUrls = @(
+        'https://clientsettingscdn.roblox.com/v2/client-version/WindowsPlayer',
+        'https://assetdelivery.roblox.com/',
+        'https://tr.rbxcdn.com/'
+    )
+    # Control probes: use lightweight URLs so a slow/heavy page doesn't disable rotation.
+    $ytUrls = @(
+        'https://www.msftconnecttest.com/connecttest.txt',
+        'https://www.youtube.com/robots.txt'
+    )
+
+    $all = @($discordUrls + $robloxUrls + $ytUrls)
+
+    $results = @()
+    try { $results = @(Test-HttpUrlsParallel -Urls $all -timeoutMs $timeoutMs) } catch { $results = @() }
+
+    $map = @{}
+    foreach ($r in $results) {
+        try {
+            if ($r -and $r.Url) { $map[[string]$r.Url] = $r }
+        } catch { }
+    }
+
+    # Discord success must include the gateway; discord.com/app alone can be a false positive.
+    $discordOk = $false
+    try {
+        $gw = 'https://gateway.discord.gg'
+        if ($map[$gw] -and $map[$gw].Ok) { $discordOk = $true }
+    } catch { }
+
+    $robloxOkCount = 0
+    foreach ($u in $robloxUrls) {
+        try { if ($map[$u] -and $map[$u].Ok) { $robloxOkCount++ } } catch { }
+    }
+    # Roblox app-like success: require 2/3 endpoints (avoid false positives from single CDN hop).
+    $robloxOk = ($robloxOkCount -ge 2)
+
+    $ytOk = $false
+    foreach ($u in $ytUrls) {
+        try { if ($map[$u] -and $map[$u].Ok) { $ytOk = $true; break } } catch { }
+    }
+
+    return [pscustomobject]@{
+        DiscordOk = $discordOk
+        RobloxOk = $robloxOk
+        YtOk = $ytOk
+        Results = $results
+    }
+}
+
+function Get-EthernetRotationQueue {
+    $out = @()
+
+    try {
+        if ($script:currentStrategyFile) { $out += $script:currentStrategyFile }
+    } catch { }
+
+    # Ethernet escalation order. Engine autopick already visits the "strong" families,
+    # so keep launcher rotation focused on the additional fallbacks.
+    $rels = @(
+        # Start from default autopick.
+        'strategies\general.bat',
+        # Strong-but-safe-first fallbacks for cable.
+        'strategies\general (ALT11).bat',
+        'strategies\general (FAKE TLS AUTO).bat',
+        'strategies\general (FAKE TLS AUTO ALT3).bat',
+        # Additional fallbacks.
+        'strategies\general (ALT7).bat',
+        'strategies\general (FAKE TLS AUTO SYNDATA).bat',
+        'strategies\general (FAKE TLS AUTO SYNDATA STRICT).bat',
+        'strategies\general (CLASSIC).bat'
+    )
+
+    foreach ($rel in $rels) {
+        try {
+            $full = Join-Path $root $rel
+            if (-not (Test-Path -LiteralPath $full)) { continue }
+            $fi = Get-Item -LiteralPath $full
+            if (-not $fi) { continue }
+
+            $exists = $false
+            foreach ($x in $out) {
+                try {
+                    if ($x -and $x.FullName -and $x.FullName -ieq $fi.FullName) { $exists = $true; break }
+                } catch { }
+            }
+
+            if (-not $exists) { $out += $fi }
+        } catch { }
+    }
+
+    return @($out)
+}
+
+function Start-EthernetAutoRotateWatcher {
+    try {
+        if (-not (Test-IsEthernetLink)) { return }
+
+        # Continuation across internal restarts: keep queue + attempt progress.
+        $hasSession = $false
+        try {
+            if ($script:ethernetAutoRotateQueue -and $script:ethernetAutoRotateQueue.Count -gt 0 -and ($script:ethernetAutoRotateQueueIndex -gt 0 -or $script:ethernetAutoRotateAttempt -gt 0)) {
+                $hasSession = $true
+            }
+        } catch { $hasSession = $false }
+
+        if (-not $hasSession) {
+            # Respect manual strategy selection: auto-rotate only when we started from default autopick (general.bat).
+            try {
+                if (-not $script:currentStrategyFile -or $script:currentStrategyFile.Name -ne 'general.bat') { return }
+            } catch { return }
+
+            Reset-EthernetAutoRotateState
+
+            $q = @(Get-EthernetRotationQueue)
+            if (-not $q -or $q.Count -lt 2) { return }
+
+            $script:ethernetAutoRotateQueue = $q
+            # Make attempt limit match the actual queue length so a manual Start always runs a full pass.
+            try { $script:ethernetAutoRotateMaxAttempts = [Math]::Max(1, $q.Count - 1) } catch { }
+            $script:ethernetAutoRotateStartedAt = Get-Date
+
+            # Minimal log: single line only on initial arm.
+            try { Write-Log ("Ethernet auto-rotate: armed (maxAttempts={0})" -f $script:ethernetAutoRotateMaxAttempts) } catch { }
+        }
+
+        # (Re)arm for this run.
+        $script:ethernetAutoRotateEnabled = $true
+        $script:ethernetAutoRotateTriggered = $false
+        $script:ethernetAutoRotateUntil = (Get-Date).AddSeconds(180)
+        $script:ethernetAutoRotateNextCheckAt = (Get-Date).AddSeconds(6)
+        $script:ethernetAutoRotateLastProbe = $null
+    } catch { }
+}
+
+function Restart-RunningWithStrategy {
+    param(
+        [System.IO.FileInfo]$strategyFile,
+        [string]$reason
+    )
+
+    if (-not $strategyFile) { return }
+
+    try {
+        if ($statusLabel) { $statusLabel.Text = ("Restarting (Ethernet): {0}" -f $strategyFile.Name) }
+    } catch { }
+
+    try { Write-Log ("Ethernet auto-rotate: switching -> {0} ({1})" -f $strategyFile.Name, $reason) } catch { }
+
+    # Avoid double restarts from other watchers.
+    try { $script:robloxAutoRetryEnabled = $false } catch { }
+
+    Stop-All
+    Stop-Winws
+    Stop-WinDivertServices -waitMs 5000 | Out-Null
+
+    $script:currentStrategyFile = $strategyFile
+    $script:runId = New-RunId
+    Write-Log "New run: $($script:runId)"
+    $script:strategyRunnerProc = Start-StrategyFile -strategyFile $strategyFile -attemptIndex 0 -runId $script:runId
+    $script:waitUntil = (Get-Date).AddSeconds(2)
+    $script:winwsStartDeadline = (Get-Date).AddMilliseconds(15000)
+    $script:captureStartDeadline = (Get-Date).AddSeconds(60)
+    $script:startState = "Starting"
+    Update-ToggleButton
+    Refresh-Logs
+}
+
+function Tick-EthernetAutoRotate {
+    if (-not $script:ethernetAutoRotateEnabled) { return }
+    if ($script:ethernetAutoRotateTriggered) { return }
+    if (-not $script:ethernetAutoRotateUntil) { return }
+
+    if ((Get-Date) -ge $script:ethernetAutoRotateUntil) {
+        try { Write-Log ("Ethernet auto-rotate: giving up after attempts={0}" -f $script:ethernetAutoRotateAttempt) } catch { }
+        try {
+            if ($statusLabel -and $script:currentStrategyFile) {
+                $statusLabel.Text = ("Ethernet: giving up after {0} attempts; running: {1}" -f $script:ethernetAutoRotateAttempt, $script:currentStrategyFile.Name)
+            }
+        } catch { }
+        try { Reset-EthernetAutoRotateState } catch { }
+        return
+    }
+
+    if ($script:ethernetAutoRotateNextCheckAt -and (Get-Date) -lt $script:ethernetAutoRotateNextCheckAt) { return }
+    $script:ethernetAutoRotateNextCheckAt = (Get-Date).AddSeconds(8)
+
+    $p = $null
+    try { $p = Invoke-PostStartProbes -timeoutMs 2500 } catch { $p = $null }
+    $script:ethernetAutoRotateLastProbe = $p
+    if (-not $p) { return }
+
+    # Track the last strategy that keeps control probes alive so we can safely revert
+    # if an escalation strategy breaks basic connectivity.
+    try {
+        if ($p.YtOk -and $script:currentStrategyFile) {
+            $script:ethernetAutoRotateLastGoodStrategyFile = $script:currentStrategyFile
+        }
+    } catch { }
+
+    # Success condition: Discord and Roblox both respond.
+    if ($p.DiscordOk -and $p.RobloxOk) {
+        try { Write-Log ("Ethernet auto-rotate: success ({0})" -f $script:currentStrategyFile.Name) } catch { }
+        try { Reset-EthernetAutoRotateState } catch { }
+        return
+    }
+
+    # If control is down too -> don't thrash.
+    if (-not $p.YtOk) {
+        $fallback = $null
+        try { $fallback = $script:ethernetAutoRotateLastGoodStrategyFile } catch { $fallback = $null }
+        $didRevert = $false
+        try {
+            if ($fallback -and $script:currentStrategyFile -and $fallback.FullName -and $script:currentStrategyFile.FullName -and ($fallback.FullName -ine $script:currentStrategyFile.FullName)) {
+                Write-Log ("Ethernet auto-rotate: control probe failed; reverting -> {0}" -f $fallback.Name)
+                $script:ethernetAutoRotateTriggered = $true
+                $didRevert = $true
+                Restart-RunningWithStrategy -strategyFile $fallback -reason "control probe failed; revert to last-good"
+            } else {
+                Write-Log "Ethernet auto-rotate: control probe failed; skipping rotation"
+            }
+        } catch { }
+        # IMPORTANT: if we reverted, keep the queue/attempt state so we can continue with the next
+        # strategy after the revert run reaches Running again.
+        if (-not $didRevert) {
+            # We have no safe fallback and control is broken.
+            # Fail-open: stop the session so we don't leave the user without internet.
+            try { Write-Log "Ethernet auto-rotate: control probe failed; stopping to avoid breaking internet" } catch { }
+            try {
+                if ($statusLabel -and $script:currentStrategyFile) {
+                    $statusLabel.Text = ("Ethernet: control probe failed; stopped: {0}" -f $script:currentStrategyFile.Name)
+                } elseif ($statusLabel) {
+                    $statusLabel.Text = "Ethernet: control probe failed; stopped"
+                }
+            } catch { }
+
+            try { Stop-All } catch { }
+            try { Reset-EthernetAutoRotateState } catch { }
+
+            try { $script:strategyRunnerProc = $null } catch { }
+            try { $script:currentStrategyFile = $null } catch { }
+            try { $script:startState = "Idle" } catch { }
+            try { Update-ToggleButton } catch { }
+        }
+        return
+    }
+
+    # Rotate when control is alive but at least one of Discord/Roblox is still failing.
+    if ($p.YtOk -and ((-not $p.DiscordOk) -or (-not $p.RobloxOk))) {
+        $nextIdx = [int]$script:ethernetAutoRotateQueueIndex + 1
+        if (-not $script:ethernetAutoRotateQueue -or $nextIdx -ge $script:ethernetAutoRotateQueue.Count) {
+            try { Write-Log ("Ethernet auto-rotate: no more strategies; attempts={0}" -f $script:ethernetAutoRotateAttempt) } catch { }
+            try {
+                if ($statusLabel -and $script:currentStrategyFile) {
+                    $statusLabel.Text = ("Ethernet: no more strategies; attempts={0}; running: {1}" -f $script:ethernetAutoRotateAttempt, $script:currentStrategyFile.Name)
+                }
+            } catch { }
+            try { Reset-EthernetAutoRotateState } catch { }
+            return
+        }
+
+        $script:ethernetAutoRotateAttempt++
+        if ($script:ethernetAutoRotateAttempt -gt $script:ethernetAutoRotateMaxAttempts) {
+            try { Write-Log ("Ethernet auto-rotate: reached maxAttempts={0}" -f $script:ethernetAutoRotateMaxAttempts) } catch { }
+            try {
+                if ($statusLabel -and $script:currentStrategyFile) {
+                    $statusLabel.Text = ("Ethernet: no success after {0} strategies; running: {1}" -f $script:ethernetAutoRotateMaxAttempts, $script:currentStrategyFile.Name)
+                }
+            } catch { }
+            try { Reset-EthernetAutoRotateState } catch { }
+            return
+        }
+
+        $script:ethernetAutoRotateQueueIndex = $nextIdx
+        $next = $script:ethernetAutoRotateQueue[$nextIdx]
+        $script:ethernetAutoRotateTriggered = $true
+
+        $reason = ("discord={0} roblox={1} (ctrl ok) attempt={2}/{3}" -f $p.DiscordOk, $p.RobloxOk, $script:ethernetAutoRotateAttempt, $script:ethernetAutoRotateMaxAttempts)
+        Restart-RunningWithStrategy -strategyFile $next -reason $reason
+        return
+    }
+}
+
 $script:generatorProc = $null
 $script:strategies = @()
 $script:strategyIndex = 0
@@ -3043,7 +3630,18 @@ function Tick-StartState {
         if ($script:startState -eq "Generating") {
             if (-not $script:generatorProc) { throw "Generator process missing." }
             try { $script:generatorProc.Refresh() } catch { }
-            if (-not $script:generatorProc.HasExited) { return }
+            if (-not $script:generatorProc.HasExited) {
+                try {
+                    $p = 45
+                    if ($script:generatorStartedAt) {
+                        $sec = ((Get-Date) - $script:generatorStartedAt).TotalSeconds
+                        if ($sec -lt 0) { $sec = 0 }
+                        $p = 45 + [Math]::Min(25, [int]($sec * 2))
+                    }
+                    Set-LoadingOverlayText "Generating..." $p
+                } catch { }
+                return
+            }
 
             $genExit = 0
             try { $genExit = [int]$script:generatorProc.ExitCode } catch { $genExit = 0 }
@@ -3058,8 +3656,8 @@ function Tick-StartState {
 
             $script:generatorProc = $null
 
-            $statusLabel.Text = "Starting strategy..."
-            try { Hide-LoadingOverlay } catch { }
+            $statusLabel.Text = "Starting (autopick...)"
+            try { Set-LoadingOverlayText "Starting (autopick...)" 75 } catch { }
 
             # Engine-side autopick: start a single configured strategy. No external Selecting/scoring.
             $strategyRel = $null
@@ -3077,8 +3675,10 @@ function Tick-StartState {
 
             $script:strategyRunnerProc = Start-StrategyFile -strategyFile $s -attemptIndex 0 -runId $script:runId
             $script:currentStrategyFile = $s
+            $script:startingStartedAt = Get-Date
             $script:waitUntil = (Get-Date).AddSeconds(2)
             $script:winwsStartDeadline = (Get-Date).AddMilliseconds(15000)
+            $script:captureStartDeadline = (Get-Date).AddSeconds(60)
             $script:startState = "Starting"
             Update-ToggleButton
             return
@@ -3103,25 +3703,65 @@ function Tick-StartState {
                 return
             }
 
+            # DGen.exe may still be running autopick and hasn't started capture yet.
+            # Only switch to Running after we see the WinDivert capture start marker.
+            $captureStarted = $false
+            try {
+                if ($script:strategyOutPath -and (Test-Path -LiteralPath $script:strategyOutPath)) {
+                    $tail = Get-Content -LiteralPath $script:strategyOutPath -Tail 120 -ErrorAction SilentlyContinue
+                    foreach ($ln in $tail) {
+                        if ($ln -like '*capture is started*') { $captureStarted = $true; break }
+                    }
+                }
+            } catch { $captureStarted = $false }
+
+            if (-not $captureStarted) {
+                if ($script:captureStartDeadline -and (Get-Date) -ge $script:captureStartDeadline) {
+                    Fail-StrategyStart -strategyFile $script:currentStrategyFile -reason "DGen.exe started but capture did not start (autopick hang?)"
+                    return
+                }
+                $statusLabel.Text = "Starting (autopick...)"
+                try {
+                    $p = 80
+                    if ($script:startingStartedAt -and $script:captureStartDeadline) {
+                        $total = ($script:captureStartDeadline - $script:startingStartedAt).TotalSeconds
+                        if ($total -lt 1) { $total = 60 }
+                        $elapsed = ((Get-Date) - $script:startingStartedAt).TotalSeconds
+                        if ($elapsed -lt 0) { $elapsed = 0 }
+                        $p = 80 + [Math]::Min(19, [int](($elapsed / $total) * 19))
+                    }
+                    Set-LoadingOverlayText "Starting (autopick...)" $p
+                } catch { }
+                return
+            }
+
             $nm = 'DGen'
             try { if ($script:currentStrategyFile) { $nm = [string]$script:currentStrategyFile.Name } } catch { }
             $statusLabel.Text = ("Running: {0}" -f $nm)
-            Write-Log ("Start done: {0}" -f $nm)
+            try { Set-LoadingOverlayText "READY: можно открывать сервисы" 100 } catch { }
+            Write-Log ("DGen RUN: {0}" -f $nm)
 
             $script:startState = "Running"
             Update-ToggleButton
             $script:waitUntil = $null
             $script:winwsStartDeadline = $null
+            $script:captureStartDeadline = $null
             try { Hide-LoadingOverlay } catch { }
+            try { Refresh-Logs } catch { }
 
             # Fast Roblox auto-retry (does NOT block start): if Roblox later reports 279/529,
             # we will restart once with wide GameFilter.
             Start-RobloxAutoRetryWatcher
+
+            # Ethernet auto-rotation (does NOT block start): if Discord+Roblox stay dead on cable,
+            # automatically try the next strategy a few times.
+            Start-EthernetAutoRotateWatcher
             return
         }
 
         if ($script:startState -eq "Running") {
             Tick-RobloxAutoRetry
+            Tick-EthernetAutoRotate
             return
         }
     } catch {
@@ -3202,6 +3842,7 @@ $toggleBtn.Add_Click({
             $script:postStartRobloxRetried = $false
             $script:activeLogPath = $logPath
             try { Clear-CurrentLogs } catch { }
+            try { if ($launcherLogBox) { $launcherLogBox.Text = "" } } catch { }
             try { Cleanup-LegacyRunLogs } catch { }
 
             try { if ($mainTabs -and $logsTab) { $mainTabs.SelectedTab = $logsTab } } catch { }
@@ -3378,7 +4019,7 @@ $toggleBtn.Add_Click({
             Write-Log "New run: $($script:runId)"
 
             $statusLabel.Text = "Generating..."
-            try { Set-LoadingOverlayText "Generating..." } catch { }
+            try { Set-LoadingOverlayText "Generating..." 45 } catch { }
             $script:generatorStartedAt = Get-Date
             $script:generatorProc = Run-Generator -cfg $cfg -runId $script:runId
 

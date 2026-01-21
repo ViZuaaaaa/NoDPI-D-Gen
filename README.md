@@ -1,4 +1,4 @@
-# D-Gen NODPI — автоматически настраивает подключение к большинству недоступных сервисов (Discord • YouTube • Roblox • Twitter • Twich ) 
+# D-Gen NODPI — автоматически настраивает подключение к недоступным сервисам (Discord • YouTube • Roblox)
 
 > [!WARNING]
 > **Официальный репозиторий:** https://github.com/ViZuaaaaa/NoDPI-D-Gen  
@@ -21,9 +21,10 @@
 ## Что это
 
 **D‑Gen** — компактный GUI‑лаунчер, который:
-- запускает набор готовых стратегий из папки `strategies/`;
-- делает быстрые проверки доступности целей;
-- автоматически подбирает наиболее рабочую стратегию для вашей сети;
+- запускает стратегию из папки `strategies/` (по умолчанию `strategies\\general.bat`);
+- стратегия запускает `bin\\DGen.exe` (движок) с режимом `--profile auto`;
+- движок сам подбирает внутренний профиль под вашу сеть и пишет диагностические логи;
+- GUI показывает статус/логи и даёт быстрые переключатели (Aggressive/QUIC/Proxy) для повторного старта.
 
 
 Проект предназначен для ситуаций, когда доступ к сервисам ломается из‑за сетевых ограничений (DPI/фильтрация/прокси‑политики и т.п.).
@@ -41,6 +42,10 @@
 - `strategies/`
 - `lists/`
 - `utils/`
+- `bin/`
+
+> [!IMPORTANT]
+> Для работы нужен `bin/` (внутри `DGen.exe`, `WinDivert.dll`, `WinDivert64.sys`, `cygwin1.dll`, *.bin).
 
 2) Запусти **`oneclick-local.bat`**.
 
@@ -56,21 +61,17 @@
 
 ## Как работает (в общих чертах)
 
-1) **Preflight**: короткие проверки (DNS/TCP/HTTP) и определение профиля блокировки.
-2) **Запуск стратегии**: стартует `general*.bat` (внутри запускается `DGen.exe`).
-3) **Scoring**: делаются быстрые проверки для ключевых целей (например Discord/Roblox), выбирается лучшая стратегия по score.
-4) **Auto‑recover / Auto‑tune**: если ничего не проходит проверки — лаунчер может один раз усилить режим (Aggressive/QUIC block/широкие порты) и повторить попытку.
-5) Дальше `DGen.exe` продолжает работать в фоне до Stop.
+1) **Preflight**: короткие проверки (DNS/TCP/HTTP).
+2) **Запуск стратегии**: стартует `general*.bat` → внутри запускается `bin\\DGen.exe --profile auto`.
+3) **Autopick**: `DGen.exe` сам выбирает внутренний профиль под текущую сеть и начинает работу (WinDivert).
+4) Дальше `DGen.exe` продолжает работать в фоне до Stop, а лаунчер показывает статус/логи.
 
 ## Установка
 
 ### Вариант A — просто скачать и запустить
-- Скачать ZIP (или релиз), распаковать.
+- Скачать **Release ZIP**, распаковать.
 - Запуск: `oneclick-local.bat`.
 
-### Вариант B — из исходников
-- Клонировать репозиторий.
-- Запуск: `oneclick-local.bat`.
 
 ## Использование
 
@@ -80,19 +81,18 @@
 3) Если что‑то не работает — открой **Advanced**, попробуй включить Aggressive Mode или QUIC block и запусти заново.
 
 ### Advanced (что означает)
-- **Smart Mode (Discord)** — включает «умный» подбор/проверки, заточенные под Discord.
-- **Auto‑recover** — если стратегия не прошла проверки, попробует другую.
+- **Smart Mode (Discord)** — включает дополнительные проверки/логику, связанную с Discord.
 - **Aggressive Mode** — более «жёсткие» параметры стратегий.
 - **Block QUIC (UDP 443)** — блокирует QUIC как один из частых источников проблем.
-- **Firewall allow (Discord)** — помогает быстро разрешить Discord через firewall.
 - **Disable Windows Proxy/PAC** — временно отключает системный proxy/PAC на время сессии (и восстанавливает на Stop).
 - **Clear Discord cache** — очистка кеша Discord (иногда помогает при странных ошибках после изменения сети).
 
 ## Логи и диагностика
 
 - Основной лог лаунчера: `D-Gen/logs/dgen-launch.log`
-- Логи генератора: `D-Gen/logs/dgen-generator.*.log`
-- Логи стратегии: `D-Gen/logs/dgen-strategy.*.log`
+- Логи генератора: `D-Gen/logs/dgen-generator.stdout.log`, `D-Gen/logs/dgen-generator.stderr.log`
+- Логи движка (DGen.exe): `D-Gen/logs/engine.stdout.log`, `D-Gen/logs/engine.log`
+- Сводка (autopick/coreprobes): `D-Gen/logs/dgen-summary.json`
 - Если GUI не открылся / сразу закрылся: `D-Gen/logs/launcher-startup.error.log`
 
 ## Troubleshooting
@@ -110,11 +110,10 @@
 <details>
 <summary><b>Start прошёл, но сервисы не работают</b></summary>
 
-1) Открой `D-Gen/logs/dgen-launch.log`.
+1) Открой `D-Gen/logs/dgen-summary.json` (если есть) и `D-Gen/logs/engine.log`.
 2) Посмотри:
-   - какой **block type** определён;
-   - какая стратегия выбрана и какой **score**;
-   - нет ли ошибок DGen/service.
+   - что выбрал **autopick** (profile/score) и какие **coreprobes** падают;
+   - нет ли ошибок драйвера/WinDivert/прав администратора.
 3) Попробуй включить **Aggressive Mode** и/или **Block QUIC**, затем Start ещё раз.
 
 </details>
@@ -122,7 +121,7 @@
 ## Структура проекта
 
 - `oneclick-local.bat` — запуск GUI
-- `D-Gen/launcher.ps1` — GUI + логика подбора стратегии
+- `D-Gen/launcher.ps1` — GUI + запуск/контроль стратегии, логи/диагностика
 - `D-Gen/config.json` — конфиг
 - `strategies/` — актуальные стратегии (`general*.bat`)
 - `lists/` — домены/ipset

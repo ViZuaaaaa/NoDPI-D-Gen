@@ -4,7 +4,7 @@ set "SYS32=%SystemRoot%\System32"
 if exist "%SYS32%\cmd.exe" (
     set "PATH=%SYS32%;%SystemRoot%;%PATH%"
 )
-set "LOCAL_VERSION=1.4.1"
+set "LOCAL_VERSION=1.4.2"
 
 if "%~1"=="status_dgen" (
     call :test_service DGen soft

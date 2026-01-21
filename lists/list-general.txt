@@ -44,6 +44,7 @@ media.discordapp.net
 images.discordapp.net
 discordcdn.com
 cdn.discordapp.com
+cdn.discord.com
 discordmerch.com
 discordpartygames.com
 discordsays.com
