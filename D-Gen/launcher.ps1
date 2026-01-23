@@ -131,11 +131,13 @@ function Clear-CurrentLogs {
     try { $script:lastSummaryRunId = '' } catch { }
     try { $script:lastSummarySourcePath = '' } catch { }
     try { $script:lastSummarySourceWriteUtc = [datetime]::MinValue } catch { }
+    try { $script:lastSummaryPostStartSig = '' } catch { }
 }
 
 $script:lastSummaryRunId = ''
 $script:lastSummarySourcePath = ''
 $script:lastSummarySourceWriteUtc = [datetime]::MinValue
+$script:lastSummaryPostStartSig = ''
 
 function Cleanup-LegacyRunLogs {
     $deleted = 0
@@ -314,6 +316,51 @@ function Write-DGenSummaryJson {
     $strategyName = ''
     try { if ($script:currentStrategyFile) { $strategyName = [string]$script:currentStrategyFile.Name } } catch { $strategyName = '' }
 
+    $postStart = $null
+    $postBlockClass = ''
+    $postBlockReason = ''
+    try {
+        $p = $script:ethernetAutoRotateLastProbe
+        if ($p) {
+            $postStart = [ordered]@{
+                discordOk = $p.DiscordOk
+                robloxOk = $p.RobloxOk
+                ctrlOk = $p.YtOk
+                discordTcp = $p.DiscordTcp
+                robloxTcp = $p.RobloxTcp
+                discordDiag = $p.DiscordDiag
+                robloxDiag = $p.RobloxDiag
+                ctrlDiag = $p.CtrlDiag
+            }
+
+            $postBlockReason = ("discord:{0} roblox:{1} ctrl:{2}" -f [string]$p.DiscordDiag, [string]$p.RobloxDiag, [string]$p.CtrlDiag)
+
+            $txt = ($postBlockReason + ' ' + [string]$p.DiscordTcp + ' ' + [string]$p.RobloxTcp).ToLowerInvariant()
+            $tcpFail = $false
+            try { if ($p.DiscordTcp -and $p.DiscordTcp -ne 'ok') { $tcpFail = $true } } catch { }
+            try { if ($p.RobloxTcp -and $p.RobloxTcp -ne 'ok') { $tcpFail = $true } } catch { }
+
+            if ($txt -match '\bdns\b') {
+                $postBlockClass = 'DNS'
+            } elseif ($tcpFail) {
+                $postBlockClass = 'CONNECT'
+            } elseif ($txt -match '\btls\b') {
+                $postBlockClass = 'TLS'
+            } elseif ($txt -match '\btimeout\b') {
+                $postBlockClass = 'TIMEOUT'
+            } elseif (-not $p.DiscordOk -or -not $p.RobloxOk) {
+                $postBlockClass = 'FAIL'
+            } else {
+                $postBlockClass = 'OK'
+                $postBlockReason = ''
+            }
+        }
+    } catch { }
+
+    $blockClass = $parsed.BlockClass
+    $blockReason = $parsed.BlockReason
+    if ($postBlockClass) { $blockClass = $postBlockClass; $blockReason = $postBlockReason }
+
     $obj = [ordered]@{
         schema = 1
         generatedAt = (Get-Date).ToString('o')
@@ -338,9 +385,10 @@ function Write-DGenSummaryJson {
         autopick = $parsed.Autopick
         coreprobes = $parsed.Coreprobes
         autotune = $parsed.Autotune
+        postStart = $postStart
         gameFilterOverride = $script:gameFilterOverride
-        blockClass = $parsed.BlockClass
-        blockReason = $parsed.BlockReason
+        blockClass = $blockClass
+        blockReason = $blockReason
         raw = [ordered]@{
             dnsFailLine = $parsed.DnsFailLine
             coreprobesLine = $parsed.CoreprobesLine
@@ -392,13 +440,22 @@ function Update-DGenSummaryJsonIfNeeded {
         $run = [string]$script:runId
         if (-not $run) { $run = '' }
 
-        if ($script:lastSummaryRunId -eq $run -and $script:lastSummarySourcePath -eq $fi.FullName -and $script:lastSummarySourceWriteUtc -eq $fi.LastWriteTimeUtc) {
+        $postSig = ''
+        try {
+            $p = $script:ethernetAutoRotateLastProbe
+            if ($p) {
+                $postSig = ("{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}" -f $p.DiscordOk, $p.RobloxOk, $p.YtOk, $p.DiscordTcp, $p.RobloxTcp, $p.DiscordDiag, $p.RobloxDiag, $p.CtrlDiag)
+            }
+        } catch { $postSig = '' }
+
+        if ($script:lastSummaryRunId -eq $run -and $script:lastSummarySourcePath -eq $fi.FullName -and $script:lastSummarySourceWriteUtc -eq $fi.LastWriteTimeUtc -and $script:lastSummaryPostStartSig -eq $postSig) {
             return
         }
 
         $script:lastSummaryRunId = $run
         $script:lastSummarySourcePath = $fi.FullName
         $script:lastSummarySourceWriteUtc = $fi.LastWriteTimeUtc
+        $script:lastSummaryPostStartSig = $postSig
 
         Write-DGenSummaryJson -engineLogPath $fi.FullName
     } catch { }
@@ -3267,6 +3324,43 @@ function Test-IsEthernetLink {
 function Invoke-PostStartProbes {
     param([int]$timeoutMs = 2000)
 
+    $getProbeCode = {
+        param($entry)
+
+        try {
+            if ($entry -and $entry.Ok) { return 'ok' }
+        } catch { }
+
+        $err = ''
+        try { if ($entry -and $entry.Error) { $err = [string]$entry.Error } } catch { $err = '' }
+        if ([string]::IsNullOrWhiteSpace($err)) { return 'fail' }
+
+        $l = $err.Trim().ToLowerInvariant()
+        if ($l -like 'timeout after*' -or $l -like '*timed out*' -or $l -like '*timeout*') { return 'timeout' }
+        if ($l -like '*secure_failure*' -or $l -like '*ssl*' -or $l -like '*tls*' -or $l -like '*authentication*') { return 'tls' }
+        if ($l -like '*no such host*' -or $l -like '*could not resolve*' -or $l -like '*name resolution*') { return 'dns' }
+        if ($l -like '*refused*') { return 'refused' }
+        return 'err'
+    }
+
+    $getTcpCode = {
+        param($tcp)
+
+        try {
+            if ($tcp -and $tcp.Ok) { return 'ok' }
+        } catch { }
+
+        $err = ''
+        try { if ($tcp) { $err = [string]$tcp.Error } } catch { $err = '' }
+        if ([string]::IsNullOrWhiteSpace($err)) { return 'fail' }
+
+        $l = $err.Trim().ToLowerInvariant()
+        if ($l -eq 'timeout') { return 'timeout' }
+        if ($l -like '*no such host*' -or $l -like '*could not resolve*' -or $l -like '*name resolution*') { return 'dns' }
+        if ($l -like '*refused*') { return 'refused' }
+        return 'err'
+    }
+
     $discordUrls = @(
         'https://discord.com/app',
         'https://gateway.discord.gg',
@@ -3314,10 +3408,55 @@ function Invoke-PostStartProbes {
         try { if ($map[$u] -and $map[$u].Ok) { $ytOk = $true; break } } catch { }
     }
 
+    $gwUrl = 'https://gateway.discord.gg'
+    $csUrl = 'https://clientsettingscdn.roblox.com/v2/client-version/WindowsPlayer'
+    $adUrl = 'https://assetdelivery.roblox.com/'
+    $trUrl = 'https://tr.rbxcdn.com/'
+    $msftUrl = 'https://www.msftconnecttest.com/connecttest.txt'
+    $ytUrl = 'https://www.youtube.com/robots.txt'
+
+    $discordGwCode = & $getProbeCode $map[$gwUrl]
+    $robloxCsCode = & $getProbeCode $map[$csUrl]
+    $robloxAdCode = & $getProbeCode $map[$adUrl]
+    $robloxTrCode = & $getProbeCode $map[$trUrl]
+    $ctrlMsftCode = & $getProbeCode $map[$msftUrl]
+    $ctrlYtCode = & $getProbeCode $map[$ytUrl]
+
+    $discordTcpCode = 'ok'
+    if (-not $discordOk) {
+        $tcp = $null
+        try { $tcp = Test-TcpConnect -hostName 'gateway.discord.gg' -port 443 -timeoutMs 800 } catch { $tcp = $null }
+        $discordTcpCode = & $getTcpCode $tcp
+    }
+
+    $robloxTcpCode = 'ok'
+    if (-not $robloxOk) {
+        $tcp = $null
+        try { $tcp = Test-TcpConnect -hostName 'clientsettingscdn.roblox.com' -port 443 -timeoutMs 800 } catch { $tcp = $null }
+        $robloxTcpCode = & $getTcpCode $tcp
+    }
+
+    $discordDiag = ''
+    if ($discordOk) { $discordDiag = 'ok' } else { $discordDiag = ("t={0} gw={1}" -f $discordTcpCode, $discordGwCode) }
+
+    $robloxDiag = ''
+    if ($robloxOk) {
+        $robloxDiag = ("ok {0}/{1}" -f $robloxOkCount, $robloxUrls.Count)
+    } else {
+        $robloxDiag = ("t={0} cs={1} ad={2} tr={3} ok={4}/{5}" -f $robloxTcpCode, $robloxCsCode, $robloxAdCode, $robloxTrCode, $robloxOkCount, $robloxUrls.Count)
+    }
+
+    $ctrlDiag = ("msft={0} yt={1}" -f $ctrlMsftCode, $ctrlYtCode)
+
     return [pscustomobject]@{
         DiscordOk = $discordOk
         RobloxOk = $robloxOk
         YtOk = $ytOk
+        DiscordTcp = $discordTcpCode
+        RobloxTcp = $robloxTcpCode
+        DiscordDiag = $discordDiag
+        RobloxDiag = $robloxDiag
+        CtrlDiag = $ctrlDiag
         Results = $results
     }
 }
@@ -3521,6 +3660,16 @@ function Tick-EthernetAutoRotate {
 
     # Rotate when control is alive but at least one of Discord/Roblox is still failing.
     if ($p.YtOk -and ((-not $p.DiscordOk) -or (-not $p.RobloxOk))) {
+        # If both services fail on TCP connect while control is alive, this doesn't look like a DPI-only problem.
+        # Rotating strategies won't help and just creates churn.
+        try {
+            if ((-not $p.DiscordOk) -and (-not $p.RobloxOk) -and $p.DiscordTcp -and $p.RobloxTcp -and ($p.DiscordTcp -ne 'ok') -and ($p.RobloxTcp -ne 'ok')) {
+                Write-Log ("Ethernet auto-rotate: Discord+Roblox TCP probes failing (d.tcp={0} r.tcp={1}); stopping rotation" -f $p.DiscordTcp, $p.RobloxTcp)
+                Reset-EthernetAutoRotateState
+                return
+            }
+        } catch { }
+
         $nextIdx = [int]$script:ethernetAutoRotateQueueIndex + 1
         if (-not $script:ethernetAutoRotateQueue -or $nextIdx -ge $script:ethernetAutoRotateQueue.Count) {
             try { Write-Log ("Ethernet auto-rotate: no more strategies; attempts={0}" -f $script:ethernetAutoRotateAttempt) } catch { }
@@ -3549,7 +3698,7 @@ function Tick-EthernetAutoRotate {
         $next = $script:ethernetAutoRotateQueue[$nextIdx]
         $script:ethernetAutoRotateTriggered = $true
 
-        $reason = ("discord={0} roblox={1} (ctrl ok) attempt={2}/{3}" -f $p.DiscordOk, $p.RobloxOk, $script:ethernetAutoRotateAttempt, $script:ethernetAutoRotateMaxAttempts)
+        $reason = ("discord={0}({1}) roblox={2}({3}) (ctrl ok) attempt={4}/{5}" -f $p.DiscordOk, $p.DiscordDiag, $p.RobloxOk, $p.RobloxDiag, $script:ethernetAutoRotateAttempt, $script:ethernetAutoRotateMaxAttempts)
         Restart-RunningWithStrategy -strategyFile $next -reason $reason
         return
     }
