@@ -68,6 +68,70 @@ function Get-IpsetAllHealth {
     }
 }
 
+function Export-DGenReport {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$zipPath
+    )
+
+    $tmp = $null
+    try {
+        $ts = Get-Date -Format "yyyyMMdd-HHmmss"
+        $tmp = Join-Path $env:TEMP ("DGen-report-{0}-{1}" -f $ts, ([Guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+
+        # Copy logs folder as-is (engine.log/prev, summary.json/prev, stdout/stderr, etc.)
+        $dstLogs = Join-Path $tmp 'logs'
+        if (Test-Path -LiteralPath $logsDir) {
+            Copy-Item -LiteralPath $logsDir -Destination $dstLogs -Recurse -Force
+        } else {
+            New-Item -ItemType Directory -Path $dstLogs -Force | Out-Null
+        }
+
+        # Add a single diagnostics.txt for quick context
+        $diagPath = Join-Path $tmp 'diagnostics.txt'
+        $diag = ''
+        try { $diag = Get-DiagnosticsText } catch { $diag = '' }
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($diagPath, $diag + [Environment]::NewLine, $utf8NoBom)
+
+        if (Test-Path -LiteralPath $zipPath) {
+            Remove-Item -LiteralPath $zipPath -Force
+        }
+        Compress-Archive -Path (Join-Path $tmp '*') -DestinationPath $zipPath -Force
+    } finally {
+        if ($tmp -and (Test-Path -LiteralPath $tmp)) {
+            try { Remove-Item -LiteralPath $tmp -Recurse -Force } catch { }
+        }
+    }
+}
+
+function Invoke-ExportReportUI {
+    try {
+        $ts = Get-Date -Format "yyyyMMdd-HHmmss"
+        $sfd = New-Object System.Windows.Forms.SaveFileDialog
+        $sfd.Title = "Save D-Gen report"
+        $sfd.Filter = "Zip (*.zip)|*.zip"
+        $sfd.FileName = ("DGen-report-{0}.zip" -f $ts)
+        try {
+            $desk = Join-Path $env:USERPROFILE 'Desktop'
+            if (Test-Path -LiteralPath $desk) { $sfd.InitialDirectory = $desk }
+        } catch { }
+
+        if ($sfd.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+        $zipPath = [string]$sfd.FileName
+        if (-not $zipPath) { return }
+        Export-DGenReport -zipPath $zipPath
+
+        try { if ($statusLabel) { $statusLabel.Text = ("Report saved: {0}" -f $zipPath) } } catch { }
+        try { Start-Process -FilePath explorer.exe -ArgumentList ('/select,"{0}"' -f $zipPath) } catch { }
+    } catch {
+        try { if ($statusLabel) { $statusLabel.Text = "Report export failed" } } catch { }
+        try { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "D-Gen", 'OK', 'Error') | Out-Null } catch { }
+    }
+}
+
 function Ensure-IpsetAllHealthy {
     $minCidr = 1000
     $minLines = 1000
@@ -325,12 +389,18 @@ function Write-DGenSummaryJson {
             $postStart = [ordered]@{
                 discordOk = $p.DiscordOk
                 robloxOk = $p.RobloxOk
-                ctrlOk = $p.YtOk
+                ctrlOk = $p.ControlOk
+                ytOk = $p.YtOk
+                ytMainOk = $p.YtMainOk
+                ytAccountsOk = $p.YtAccountsOk
+                ytVideoOk = $p.YtVideoOk
+                ytImgOk = $p.YtImgOk
                 discordTcp = $p.DiscordTcp
                 robloxTcp = $p.RobloxTcp
                 discordDiag = $p.DiscordDiag
                 robloxDiag = $p.RobloxDiag
                 ctrlDiag = $p.CtrlDiag
+                ytDiag = $p.YtDiag
             }
 
             $postBlockReason = ("discord:{0} roblox:{1} ctrl:{2}" -f [string]$p.DiscordDiag, [string]$p.RobloxDiag, [string]$p.CtrlDiag)
@@ -444,7 +514,7 @@ function Update-DGenSummaryJsonIfNeeded {
         try {
             $p = $script:ethernetAutoRotateLastProbe
             if ($p) {
-                $postSig = ("{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}" -f $p.DiscordOk, $p.RobloxOk, $p.YtOk, $p.DiscordTcp, $p.RobloxTcp, $p.DiscordDiag, $p.RobloxDiag, $p.CtrlDiag)
+                $postSig = ("{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}|{9}|{10}|{11}" -f $p.DiscordOk, $p.RobloxOk, $p.ControlOk, $p.YtOk, $p.YtAccountsOk, $p.YtVideoOk, $p.DiscordTcp, $p.RobloxTcp, $p.DiscordDiag, $p.RobloxDiag, $p.CtrlDiag, $p.YtDiag)
             }
         } catch { $postSig = '' }
 
@@ -777,16 +847,17 @@ function Get-RobloxEndpointsFromRecentLogs {
     $logDir = Get-RobloxLogDir
     if (-not $logDir) { return $null }
 
-    $files = @(Get-ChildItem -LiteralPath $logDir -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 6)
+    $files = @(Get-ChildItem -LiteralPath $logDir -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 20)
     if (-not $files -or $files.Count -eq 0) { return $null }
 
     $hosts = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $ips = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $sample = $null
+    $has277 = $false
     $has279 = $false
     $has529 = $false
 
-    $rxBad = [regex]'\b(279|529|connect|connecting|connection|timeout|timed out|failed|handshake|udp|tcp|unreachable|reset|refused)\b'
+    $rxBad = [regex]'\b(277|279|529|connect|connecting|connection|timeout|timed out|failed|handshake|udp|tcp|unreachable|reset|refused)\b'
     $rxUrl = [regex]'https?://([a-zA-Z0-9.-]+)'
     $rxHostPort = [regex]'(?<![a-zA-Z0-9.-])([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(?::\d{2,5})?'
     $rxIPv4 = [regex]'(?<![\d.])((?:\d{1,3}\.){3}\d{1,3})(?::\d{2,5})?'
@@ -794,7 +865,14 @@ function Get-RobloxEndpointsFromRecentLogs {
 
     foreach ($f in $files) {
         $lines = @()
-        try { $lines = Get-Content -LiteralPath $f.FullName -Tail $tailLines -Encoding UTF8 -ErrorAction Stop } catch { continue }
+        $hasNul = $false
+        try { $lines = Get-Content -LiteralPath $f.FullName -Tail $tailLines -Encoding UTF8 -ErrorAction Stop } catch { $lines = @() }
+        try {
+            foreach ($ln in $lines) { if ($ln -match [char]0) { $hasNul = $true; break } }
+        } catch { $hasNul = $false }
+        if (-not $lines -or $lines.Count -eq 0 -or $hasNul) {
+            try { $lines = Get-Content -LiteralPath $f.FullName -Tail $tailLines -Encoding Unicode -ErrorAction Stop } catch { continue }
+        }
 
         foreach ($line in $lines) {
             $bad = $false
@@ -811,6 +889,7 @@ function Get-RobloxEndpointsFromRecentLogs {
                 $sample = if ($line.Length -gt 220) { $line.Substring(0, 220) + '...' } else { $line }
             }
 
+            if (-not $has277 -and ($line -match '\b277\b')) { $has277 = $true }
             if (-not $has279 -and ($line -match '\b279\b')) { $has279 = $true }
             if (-not $has529 -and ($line -match '\b529\b')) { $has529 = $true }
 
@@ -871,6 +950,7 @@ function Get-RobloxEndpointsFromRecentLogs {
         Hosts = $hostList
         Ips = $ipList
         Sample = $sample
+        Has277 = $has277
         Has279 = $has279
         Has529 = $has529
     }
@@ -1020,19 +1100,65 @@ function Ensure-DGenEngineReady {
     $binDir = Join-Path $root 'bin'
     $exePath = Join-Path $binDir 'DGen.exe'
 
-    if (Test-Path -LiteralPath $exePath) {
-        return $true
+    if (-not (Test-Path -LiteralPath $exePath)) {
+        Write-Log ("Engine missing: {0}" -f $exePath)
+        try { Hide-LoadingOverlay } catch { }
+        try { $statusLabel.Text = "Start blocked: missing DGen.exe" } catch { }
+
+        $msg = "DGen.exe not found in bin.\r\n\r\n" +
+            "Most common cause: you downloaded the source 'Code ZIP' from GitHub (it does not include bin/).\r\n\r\n" +
+            "Fix: use the Release zip (recommended), OR place/rename the engine binary to:\r\n\r\n$exePath"
+        try { [System.Windows.Forms.MessageBox]::Show($msg, 'D-Gen', 'OK', 'Error') | Out-Null } catch { }
+        return $false
     }
 
-    Write-Log ("Engine missing: {0}" -f $exePath)
-    try { Hide-LoadingOverlay } catch { }
-    try { $statusLabel.Text = "Start blocked: missing DGen.exe" } catch { }
+    $missing = New-Object System.Collections.Generic.List[string]
 
-    $msg = "DGen.exe not found in bin.\r\n\r\n" +
-        "Most common cause: you downloaded the source 'Code ZIP' from GitHub (it does not include bin/).\r\n\r\n" +
-        "Fix: use the Release zip (recommended), OR place/rename the engine binary to:\r\n\r\n$exePath"
-    try { [System.Windows.Forms.MessageBox]::Show($msg, 'D-Gen', 'OK', 'Error') | Out-Null } catch { }
-    return $false
+    try {
+        if (-not (Test-Path -LiteralPath (Join-Path $binDir 'WinDivert.dll'))) { [void]$missing.Add('WinDivert.dll') }
+    } catch { [void]$missing.Add('WinDivert.dll') }
+
+    try {
+        $drv64 = Join-Path $binDir 'WinDivert64.sys'
+        $drv = Join-Path $binDir 'WinDivert.sys'
+        if (-not (Test-Path -LiteralPath $drv64) -and -not (Test-Path -LiteralPath $drv)) {
+            [void]$missing.Add('WinDivert64.sys')
+        }
+    } catch { [void]$missing.Add('WinDivert64.sys') }
+
+    try {
+        if (-not (Test-Path -LiteralPath (Join-Path $binDir 'cygwin1.dll'))) { [void]$missing.Add('cygwin1.dll') }
+    } catch { [void]$missing.Add('cygwin1.dll') }
+
+    $templates = @(
+        'quic_initial_www_google_com.bin',
+        'tls_clienthello_4pda_to.bin',
+        'tls_clienthello_www_google_com.bin'
+    )
+    foreach ($f in $templates) {
+        try {
+            if (-not (Test-Path -LiteralPath (Join-Path $binDir $f))) { [void]$missing.Add($f) }
+        } catch {
+            [void]$missing.Add($f)
+        }
+    }
+
+    if ($missing.Count -gt 0) {
+        $uniq = @($missing | Sort-Object -Unique)
+        $lines = ($uniq | ForEach-Object { " - $_" }) -join "`r`n"
+
+        Write-Log ("Engine deps missing in bin: {0}" -f (($uniq) -join ', '))
+        try { Hide-LoadingOverlay } catch { }
+        try { $statusLabel.Text = "Start blocked: missing runtime files" } catch { }
+
+        $msg = "Required runtime files are missing in bin:\r\n\r\n$lines\r\n\r\n" +
+            "Most common cause: GitHub 'Code ZIP' (does not include bin/).\r\n\r\n" +
+            "Fix: use the Release zip (recommended) OR copy the full bin/ folder next to launcher.\r\n\r\nBin folder:\r\n$binDir"
+        try { [System.Windows.Forms.MessageBox]::Show($msg, 'D-Gen', 'OK', 'Error') | Out-Null } catch { }
+        return $false
+    }
+
+    return $true
 }
 
 function Reset-TextLog {
@@ -1149,6 +1275,7 @@ function Filter-LauncherLogForUi {
             $msg -eq 'Stop requested' -or
             $msg -like 'Stop-All:*' -or
             $msg -like 'Ethernet auto-rotate:*' -or
+            $msg -like 'WiFi auto-rotate:*' -or
             $msg -like 'Roblox auto-retry:*' -or
             $msg -like 'FATAL:*' -or
             $msg -like 'ERROR:*' -or
@@ -1361,6 +1488,22 @@ function Get-NetworkProfileKey {
             try { $ifIndex = [int]($ipProps.GetIPv4Properties().Index) } catch { $ifIndex = $null }
             if ($activeIfIndex -ne $null -and $ifIndex -ne $activeIfIndex) { continue }
 
+            if ($script:networkIfIndex -eq $null -and $ifIndex -ne $null) {
+                try { $script:networkIfIndex = [int]$ifIndex } catch { $script:networkIfIndex = $null }
+            }
+            if (-not $script:networkIfGuid) {
+                try { if ($ni.Id) { $script:networkIfGuid = [string]$ni.Id } } catch { }
+            }
+            if (-not $script:networkIfAlias) {
+                try { if ($ni.Name) { $script:networkIfAlias = [string]$ni.Name } } catch { }
+            }
+            if ($script:networkMtu -eq $null) {
+                try {
+                    $ipv4 = $ipProps.GetIPv4Properties()
+                    if ($ipv4) { $script:networkMtu = [int]$ipv4.Mtu }
+                } catch { }
+            }
+
             if ($script:networkLinkType -eq 'unknown') {
                 try {
                     if ($ni.NetworkInterfaceType -eq [System.Net.NetworkInformation.NetworkInterfaceType]::Wireless80211) {
@@ -1403,6 +1546,19 @@ function Get-NetworkProfileKey {
                 try {
                     if ($d -and $d.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { $dhcp.Add($d.IPAddressToString) | Out-Null }
                 } catch { }
+            }
+        }
+
+        if ($script:networkLinkType -eq 'unknown' -and $activeIfIndex -ne $null) {
+            $alias = ''
+            try { if ($script:networkIfAlias) { $alias = [string]$script:networkIfAlias } } catch { $alias = '' }
+            if (-not $alias) { $alias = '' }
+
+            $aliasNorm = $alias.ToLowerInvariant()
+            if ($aliasNorm.Contains('wi-fi') -or $aliasNorm.Contains('wifi') -or $aliasNorm.Contains('wireless')) {
+                $script:networkLinkType = 'wifi'
+            } else {
+                $script:networkLinkType = 'ethernet'
             }
         }
 
@@ -2173,6 +2329,7 @@ function Start-StrategyFile {
     }
     if ($script:gameFilterOverride) {
         $cmdParts += ('set "GameFilter={0}"' -f [string]$script:gameFilterOverride)
+        $cmdParts += 'set "DGEN_WF_UDP_WIDE=1"'
     }
 
     # Engine autopick support: pass network profile key so DGen.exe can persist last-good profile per network.
@@ -2600,6 +2757,16 @@ $clearLogsHeaderBtn.ForeColor = $uiMuted
 $clearLogsHeaderBtn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 10, 0)
 $clearLogsHeaderBtn.Add_Click({ Invoke-DeleteLogsUI })
 
+$reportHeaderBtn = New-Object System.Windows.Forms.Button
+$reportHeaderBtn.Text = "Report"
+$reportHeaderBtn.Size = New-Object System.Drawing.Size(90, 30)
+$reportHeaderBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$reportHeaderBtn.FlatAppearance.BorderSize = 0
+$reportHeaderBtn.BackColor = $uiPanel
+$reportHeaderBtn.ForeColor = $uiMuted
+$reportHeaderBtn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 10, 0)
+$reportHeaderBtn.Add_Click({ Invoke-ExportReportUI })
+
 $closeBtn = New-Object System.Windows.Forms.Button
 $closeBtn.Text = "Close"
 $closeBtn.Size = New-Object System.Drawing.Size(90, 30)
@@ -2611,6 +2778,7 @@ $closeBtn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
 
 [void]$script:headerNav.Controls.Add($advancedBtn)
 [void]$script:headerNav.Controls.Add($clearLogsHeaderBtn)
+[void]$script:headerNav.Controls.Add($reportHeaderBtn)
 [void]$script:headerNav.Controls.Add($closeBtn)
 
 $optionsPanel = New-Object System.Windows.Forms.Panel
@@ -3141,6 +3309,16 @@ $script:uiBusy = $false
 $script:runId = $null
 $script:networkProfileKey = ''
 $script:networkLinkType = ''
+
+# Manual start sequence (increments only on user Start click).
+# Used to prevent auto-retry loops across internal restarts.
+$script:manualStartSeq = 0
+
+# Roblox auto-retry: allow at most one internal restart per manual Start.
+$script:robloxAutoRetryRestartCount = 0
+
+# WiFi auto-rotate: allow at most one internal restart per manual Start.
+$script:wifiAutoRotateRestartCount = 0
 $script:generatorOutPath = $defaultGeneratorOutPath
 $script:generatorErrPath = $defaultGeneratorErrPath
 $script:strategyOutPath = $defaultStrategyOutPath
@@ -3172,6 +3350,10 @@ function Test-WantsRoblox {
 }
 
 function Start-RobloxAutoRetryWatcher {
+    # Safety: never allow more than one internal restart per manual Start.
+    # Internal restarts re-enter Running and would otherwise re-arm the watcher.
+    try { if ($script:robloxAutoRetryRestartCount -ge 1) { return } } catch { }
+
     # Only watch when Roblox is a requested domain and we are NOT already in wide GameFilter mode.
     $script:robloxAutoRetryEnabled = $false
     $script:robloxAutoRetryTriggered = $false
@@ -3182,7 +3364,6 @@ function Start-RobloxAutoRetryWatcher {
 
     try {
         if (-not (Test-WantsRoblox)) { return }
-        if ($script:autoTunedGameFilter) { return }
 
         # Even if GameFilterOverride is already enabled (e.g., from previous 279 logs),
         # still watch for *new* 279/529 so we can ingest fresh server IPs and restart once.
@@ -3191,7 +3372,8 @@ function Start-RobloxAutoRetryWatcher {
         $script:robloxAutoRetryEnabled = $true
         $script:robloxAutoRetryStartedAt = Get-Date
         $script:robloxAutoRetryUntil = (Get-Date).AddMinutes(10)
-        $script:robloxAutoRetryNextCheckAt = (Get-Date)
+        # Debounce initial scan to avoid flapping and allow IP collection.
+        $script:robloxAutoRetryNextCheckAt = (Get-Date).AddSeconds(3)
         Write-Log "Roblox auto-retry: watcher armed (10min window)"
     } catch { }
 }
@@ -3208,12 +3390,6 @@ function Tick-RobloxAutoRetry {
     if ($script:robloxAutoRetryNextCheckAt -and (Get-Date) -lt $script:robloxAutoRetryNextCheckAt) { return }
     $script:robloxAutoRetryNextCheckAt = (Get-Date).AddSeconds(5)
 
-    # If user already enabled wide ports during this run, stop watching.
-    if ($script:gameFilterOverride -or $script:autoTunedGameFilter) {
-        $script:robloxAutoRetryEnabled = $false
-        return
-    }
-
     # Avoid reacting to ancient 279/529 entries: only consider logs that were written after we armed the watcher.
     try {
         if ($script:robloxAutoRetryStartedAt) {
@@ -3226,14 +3402,8 @@ function Tick-RobloxAutoRetry {
     } catch { }
 
     try {
-        $rob = Get-RobloxEndpointsFromRecentLogs -tailLines 2500
+        $rob = Get-RobloxEndpointsFromRecentLogs -tailLines 8000
         if (-not $rob) { return }
-
-        $needWidePorts = $false
-        try { if ($rob.PSObject.Properties.Name -contains 'Has279' -and $rob.Has279) { $needWidePorts = $true } } catch { }
-        try { if ($rob.PSObject.Properties.Name -contains 'Has529' -and $rob.Has529) { $needWidePorts = $true } } catch { }
-
-        if (-not $needWidePorts) { return }
 
         $hosts = @()
         $ips = @()
@@ -3251,18 +3421,41 @@ function Tick-RobloxAutoRetry {
             }
         } catch { }
 
-        $script:robloxAutoRetryTriggered = $true
-        $script:robloxAutoRetryEnabled = $false
-        $script:autoTunedGameFilter = $true
-
         $hadWide = $false
         try { if ($script:gameFilterOverride) { $hadWide = $true } } catch { $hadWide = $false }
 
+        $needWidePorts = $false
+        try { if ($rob.PSObject.Properties.Name -contains 'Has277' -and $rob.Has277) { $needWidePorts = $true } } catch { }
+        try { if ($rob.PSObject.Properties.Name -contains 'Has279' -and $rob.Has279) { $needWidePorts = $true } } catch { }
+        try { if ($rob.PSObject.Properties.Name -contains 'Has529' -and $rob.Has529) { $needWidePorts = $true } } catch { }
+
+        # Optimization: if we are already running with wide GameFilter and we learned new Roblox server IPs,
+        # restart once early to apply the ipset updates (helps avoid "Roblox only works on 2nd try").
+        if (-not $needWidePorts) {
+            if (-not ($hadWide -and $addedIps -gt 0)) { return }
+        }
+
+        # If we are already in wide mode and did not learn new IPs, restarting won't help.
+        if ($hadWide -and $addedIps -le 0) {
+            $script:robloxAutoRetryTriggered = $true
+            $script:robloxAutoRetryEnabled = $false
+            Write-Log ("Roblox auto-retry: detected 277/279/529; ipsFound={0} addedIps={1}; no new IPs; skip restart" -f $ips.Count, $addedIps)
+            return
+        }
+
+        $script:robloxAutoRetryTriggered = $true
+        $script:robloxAutoRetryEnabled = $false
+        try { $script:robloxAutoRetryRestartCount++ } catch { }
+
         if (-not $hadWide) {
             $script:gameFilterOverride = '1024-65535'
-            Write-Log ("Roblox auto-retry: detected 279/529; ipsFound={0} addedIps={1}; enabling GameFilter=1024-65535 and restarting" -f $ips.Count, $addedIps)
+            Write-Log ("Roblox auto-retry: detected 277/279/529; ipsFound={0} addedIps={1}; enabling GameFilter=1024-65535 and restarting" -f $ips.Count, $addedIps)
         } else {
-            Write-Log ("Roblox auto-retry: detected 279/529; ipsFound={0} addedIps={1}; restarting to apply ipset updates" -f $ips.Count, $addedIps)
+            if ($needWidePorts) {
+                Write-Log ("Roblox auto-retry: detected 277/279/529; ipsFound={0} addedIps={1}; restarting to apply ipset updates" -f $ips.Count, $addedIps)
+            } else {
+                Write-Log ("Roblox auto-retry: learned new IPs; ipsFound={0} addedIps={1}; restarting early to apply ipset updates" -f $ips.Count, $addedIps)
+            }
         }
 
         # Fast restart: stop current DGen and immediately start the same strategy with new env.
@@ -3371,13 +3564,28 @@ function Invoke-PostStartProbes {
         'https://assetdelivery.roblox.com/',
         'https://tr.rbxcdn.com/'
     )
-    # Control probes: use lightweight URLs so a slow/heavy page doesn't disable rotation.
-    $ytUrls = @(
-        'https://www.msftconnecttest.com/connecttest.txt',
-        'https://www.youtube.com/robots.txt'
+    # Control probes: keep them independent of YouTube so we can detect "YouTube-only" breakage.
+    # Prefer HTTP for msftconnecttest to avoid TLS-related false negatives on some ISPs.
+    $controlUrls = @(
+        'http://www.msftconnecttest.com/connecttest.txt',
+        'https://www.msftconnecttest.com/connecttest.txt'
     )
 
-    $all = @($discordUrls + $robloxUrls + $ytUrls)
+    # YouTube probes: split accounts vs video to avoid false "internet ok" when only robots.txt loads.
+    $ytMainUrls = @(
+        'https://www.youtube.com/robots.txt'
+    )
+    $ytAccountsUrls = @(
+        'https://accounts.google.com/'
+    )
+    $ytVideoUrls = @(
+        'https://redirector.googlevideo.com/'
+    )
+    $ytImgUrls = @(
+        'https://i.ytimg.com/'
+    )
+
+    $all = @($discordUrls + $robloxUrls + $controlUrls + $ytMainUrls + $ytAccountsUrls + $ytVideoUrls + $ytImgUrls)
 
     $results = @()
     try { $results = @(Test-HttpUrlsParallel -Urls $all -timeoutMs $timeoutMs) } catch { $results = @() }
@@ -3403,24 +3611,55 @@ function Invoke-PostStartProbes {
     # Roblox app-like success: require 2/3 endpoints (avoid false positives from single CDN hop).
     $robloxOk = ($robloxOkCount -ge 2)
 
-    $ytOk = $false
-    foreach ($u in $ytUrls) {
-        try { if ($map[$u] -and $map[$u].Ok) { $ytOk = $true; break } } catch { }
+    $controlOk = $false
+    foreach ($u in $controlUrls) {
+        try { if ($map[$u] -and $map[$u].Ok) { $controlOk = $true; break } } catch { }
     }
+
+    $ytMainOk = $false
+    foreach ($u in $ytMainUrls) {
+        try { if ($map[$u] -and $map[$u].Ok) { $ytMainOk = $true; break } } catch { }
+    }
+
+    $ytAccountsOk = $false
+    foreach ($u in $ytAccountsUrls) {
+        try { if ($map[$u] -and $map[$u].Ok) { $ytAccountsOk = $true; break } } catch { }
+    }
+
+    $ytVideoOk = $false
+    foreach ($u in $ytVideoUrls) {
+        try { if ($map[$u] -and $map[$u].Ok) { $ytVideoOk = $true; break } } catch { }
+    }
+
+    $ytImgOk = $false
+    foreach ($u in $ytImgUrls) {
+        try { if ($map[$u] -and $map[$u].Ok) { $ytImgOk = $true; break } } catch { }
+    }
+
+    # Overall YouTube health for UX decisions. Keep it strict: if video redirector is blocked, video won't play.
+    $ytOk = ($ytMainOk -and $ytAccountsOk -and $ytVideoOk)
 
     $gwUrl = 'https://gateway.discord.gg'
     $csUrl = 'https://clientsettingscdn.roblox.com/v2/client-version/WindowsPlayer'
     $adUrl = 'https://assetdelivery.roblox.com/'
     $trUrl = 'https://tr.rbxcdn.com/'
-    $msftUrl = 'https://www.msftconnecttest.com/connecttest.txt'
-    $ytUrl = 'https://www.youtube.com/robots.txt'
+    $msftHttpUrl = 'http://www.msftconnecttest.com/connecttest.txt'
+    $msftHttpsUrl = 'https://www.msftconnecttest.com/connecttest.txt'
+    $ytMainUrl = 'https://www.youtube.com/robots.txt'
+    $ytAccountsUrl = 'https://accounts.google.com/'
+    $ytVideoUrl = 'https://redirector.googlevideo.com/'
+    $ytImgUrl = 'https://i.ytimg.com/'
 
     $discordGwCode = & $getProbeCode $map[$gwUrl]
     $robloxCsCode = & $getProbeCode $map[$csUrl]
     $robloxAdCode = & $getProbeCode $map[$adUrl]
     $robloxTrCode = & $getProbeCode $map[$trUrl]
-    $ctrlMsftCode = & $getProbeCode $map[$msftUrl]
-    $ctrlYtCode = & $getProbeCode $map[$ytUrl]
+    $ctrlMsftHttpCode = & $getProbeCode $map[$msftHttpUrl]
+    $ctrlMsftHttpsCode = & $getProbeCode $map[$msftHttpsUrl]
+    $ytMainCode = & $getProbeCode $map[$ytMainUrl]
+    $ytAccountsCode = & $getProbeCode $map[$ytAccountsUrl]
+    $ytVideoCode = & $getProbeCode $map[$ytVideoUrl]
+    $ytImgCode = & $getProbeCode $map[$ytImgUrl]
 
     $discordTcpCode = 'ok'
     if (-not $discordOk) {
@@ -3446,19 +3685,158 @@ function Invoke-PostStartProbes {
         $robloxDiag = ("t={0} cs={1} ad={2} tr={3} ok={4}/{5}" -f $robloxTcpCode, $robloxCsCode, $robloxAdCode, $robloxTrCode, $robloxOkCount, $robloxUrls.Count)
     }
 
-    $ctrlDiag = ("msft={0} yt={1}" -f $ctrlMsftCode, $ctrlYtCode)
+    $ctrlDiag = ("msft_http={0} msft_https={1}" -f $ctrlMsftHttpCode, $ctrlMsftHttpsCode)
+    $ytDiag = ("main={0} acc={1} video={2} img={3}" -f $ytMainCode, $ytAccountsCode, $ytVideoCode, $ytImgCode)
 
     return [pscustomobject]@{
         DiscordOk = $discordOk
         RobloxOk = $robloxOk
+        ControlOk = $controlOk
+        YtMainOk = $ytMainOk
+        YtAccountsOk = $ytAccountsOk
+        YtVideoOk = $ytVideoOk
+        YtImgOk = $ytImgOk
         YtOk = $ytOk
         DiscordTcp = $discordTcpCode
         RobloxTcp = $robloxTcpCode
         DiscordDiag = $discordDiag
         RobloxDiag = $robloxDiag
         CtrlDiag = $ctrlDiag
+        YtDiag = $ytDiag
         Results = $results
     }
+}
+
+# Post-start probe snapshot (all link types): run once shortly after Running so dgen-summary.json
+# contains Control + YouTube accounts/video diagnostics even when Ethernet auto-rotate is disabled.
+$script:postStartSnapshotEnabled = $false
+$script:postStartSnapshotDone = $false
+$script:postStartSnapshotNextCheckAt = $null
+
+function Start-PostStartProbeSnapshot {
+    $script:postStartSnapshotEnabled = $true
+    $script:postStartSnapshotDone = $false
+    $script:postStartSnapshotNextCheckAt = (Get-Date).AddSeconds(8)
+}
+
+function Tick-PostStartProbeSnapshot {
+    if (-not $script:postStartSnapshotEnabled) { return }
+    if ($script:postStartSnapshotDone) { return }
+
+    if ($script:postStartSnapshotNextCheckAt -and (Get-Date) -lt $script:postStartSnapshotNextCheckAt) { return }
+
+    $script:postStartSnapshotDone = $true
+
+    $p = $null
+    try { $p = Invoke-PostStartProbes -timeoutMs 2500 } catch { $p = $null }
+    if ($p) {
+        # Reuse the existing summary wiring (Write-DGenSummaryJson reads ethernetAutoRotateLastProbe).
+        $script:ethernetAutoRotateLastProbe = $p
+        Try-WifiAutoRotateFromProbe -probe $p
+    }
+}
+
+# WiFi auto-rotate (conservative): if control probes are OK but YouTube/Discord fail on Wi-Fi,
+# restart ONCE per manual Start with a safer fallback strategy.
+function Restart-RunningWithStrategyWifi {
+    param(
+        [System.IO.FileInfo]$strategyFile,
+        [string]$reason
+    )
+
+    if (-not $strategyFile) { return }
+
+    try {
+        if ($statusLabel) { $statusLabel.Text = ("Restarting (WiFi): {0}" -f $strategyFile.Name) }
+    } catch { }
+
+    try { Write-Log ("WiFi auto-rotate: switching -> {0} ({1})" -f $strategyFile.Name, $reason) } catch { }
+
+    # Avoid double restarts from other watchers.
+    try { $script:robloxAutoRetryEnabled = $false } catch { }
+    try { $script:ethernetAutoRotateEnabled = $false } catch { }
+
+    Stop-All
+    Stop-Winws
+    Stop-WinDivertServices -waitMs 5000 | Out-Null
+
+    $script:currentStrategyFile = $strategyFile
+    $script:runId = New-RunId
+    Write-Log "New run: $($script:runId)"
+    $script:strategyRunnerProc = Start-StrategyFile -strategyFile $strategyFile -attemptIndex 0 -runId $script:runId
+    $script:waitUntil = (Get-Date).AddSeconds(2)
+    $script:winwsStartDeadline = (Get-Date).AddMilliseconds(15000)
+    $script:captureStartDeadline = (Get-Date).AddSeconds(60)
+    $script:startState = "Starting"
+    Update-ToggleButton
+    Refresh-Logs
+}
+
+function Get-WifiAutoRotateFallbackStrategyFile {
+    param($probe)
+
+    $rel = ''
+    try {
+        if ($probe -and (-not $probe.YtOk) -and $probe.DiscordOk) { $rel = 'strategies\\general (CLASSIC).bat' }
+    } catch { $rel = '' }
+
+    if (-not $rel) {
+        try {
+            if ($probe -and (-not $probe.DiscordOk) -and $probe.YtOk) { $rel = 'strategies\\general (ALT11).bat' }
+        } catch { $rel = '' }
+    }
+
+    if (-not $rel) { $rel = 'strategies\\general (FAKE TLS AUTO).bat' }
+
+    try {
+        $full = Join-Path $root $rel
+        if (-not (Test-Path -LiteralPath $full)) { return $null }
+        return (Get-Item -LiteralPath $full)
+    } catch { return $null }
+}
+
+function Try-WifiAutoRotateFromProbe {
+    param($probe)
+
+    try { if (-not $probe) { return } } catch { return }
+
+    # Only on Wi-Fi, only once per manual Start.
+    try { if ($script:wifiAutoRotateRestartCount -ge 1) { return } } catch { }
+
+    try { if (Test-IsEthernetLink) { return } } catch { }
+
+    try {
+        $t = [string]$script:networkLinkType
+        if (-not $t -or $t.Trim().ToLowerInvariant() -ne 'wifi') { return }
+    } catch { return }
+
+    # Respect manual strategy selection: auto-rotate only when we started from default autopick (general.bat).
+    try {
+        if (-not $script:currentStrategyFile -or $script:currentStrategyFile.Name -ne 'general.bat') { return }
+    } catch { return }
+
+    # Don't risk breaking the internet when control is down.
+    try { if (-not $probe.ControlOk) { return } } catch { return }
+
+    $need = $false
+    try {
+        if ((-not $probe.YtOk) -or (-not $probe.DiscordOk)) { $need = $true }
+    } catch { $need = $false }
+
+    if (-not $need) { return }
+
+    $next = $null
+    try { $next = Get-WifiAutoRotateFallbackStrategyFile -probe $probe } catch { $next = $null }
+    if (-not $next) {
+        try { Write-Log "WiFi auto-rotate: no fallback strategy found; skipping" } catch { }
+        return
+    }
+
+    try { $script:wifiAutoRotateRestartCount++ } catch { }
+
+    $reason = ''
+    try { $reason = ("ytOk={0} discordOk={1} ctrlOk={2}" -f $probe.YtOk, $probe.DiscordOk, $probe.ControlOk) } catch { $reason = 'probe failure' }
+    Restart-RunningWithStrategyWifi -strategyFile $next -reason $reason
 }
 
 function Get-EthernetRotationQueue {
@@ -3606,7 +3984,7 @@ function Tick-EthernetAutoRotate {
     # Track the last strategy that keeps control probes alive so we can safely revert
     # if an escalation strategy breaks basic connectivity.
     try {
-        if ($p.YtOk -and $script:currentStrategyFile) {
+        if ($p.ControlOk -and $script:currentStrategyFile) {
             $script:ethernetAutoRotateLastGoodStrategyFile = $script:currentStrategyFile
         }
     } catch { }
@@ -3619,7 +3997,7 @@ function Tick-EthernetAutoRotate {
     }
 
     # If control is down too -> don't thrash.
-    if (-not $p.YtOk) {
+    if (-not $p.ControlOk) {
         $fallback = $null
         try { $fallback = $script:ethernetAutoRotateLastGoodStrategyFile } catch { $fallback = $null }
         $didRevert = $false
@@ -3659,7 +4037,7 @@ function Tick-EthernetAutoRotate {
     }
 
     # Rotate when control is alive but at least one of Discord/Roblox is still failing.
-    if ($p.YtOk -and ((-not $p.DiscordOk) -or (-not $p.RobloxOk))) {
+    if ($p.ControlOk -and ((-not $p.DiscordOk) -or (-not $p.RobloxOk))) {
         # If both services fail on TCP connect while control is alive, this doesn't look like a DPI-only problem.
         # Rotating strategies won't help and just creates churn.
         try {
@@ -3813,7 +4191,12 @@ function Tick-StartState {
             try { if ($cfg -and ($cfg.PSObject.Properties.Name -contains 'strategy')) { $strategyRel = [string]$cfg.strategy } } catch { $strategyRel = $null }
             if (-not $strategyRel) { $strategyRel = 'strategies\\general.bat' }
             $strategyFull = Join-Path $root $strategyRel
-            if (-not (Test-Path -LiteralPath $strategyFull)) { throw "Strategy not found: $strategyFull" }
+			if (-not (Test-Path -LiteralPath $strategyFull)) {
+				Write-Log ("Strategy not found (from config): {0}" -f $strategyFull)
+				$strategyRel = 'strategies\\general.bat'
+				$strategyFull = Join-Path $root $strategyRel
+				if (-not (Test-Path -LiteralPath $strategyFull)) { throw "Strategy not found: $strategyFull" }
+			}
             $s = Get-Item -LiteralPath $strategyFull
 
             Stop-Winws
@@ -3905,10 +4288,14 @@ function Tick-StartState {
             # Ethernet auto-rotation (does NOT block start): if Discord+Roblox stay dead on cable,
             # automatically try the next strategy a few times.
             Start-EthernetAutoRotateWatcher
+
+            # Post-start snapshot (does NOT block start): record Control + YouTube accounts/video status in summary.
+            Start-PostStartProbeSnapshot
             return
         }
 
         if ($script:startState -eq "Running") {
+            Tick-PostStartProbeSnapshot
             Tick-RobloxAutoRetry
             Tick-EthernetAutoRotate
             return
@@ -3972,6 +4359,20 @@ $toggleBtn.Add_Click({
             } catch { }
 
             $script:runId = New-RunId
+
+            # New manual Start session.
+            try { $script:manualStartSeq++ } catch { }
+            try { $script:robloxAutoRetryRestartCount = 0 } catch { }
+            try { $script:wifiAutoRotateRestartCount = 0 } catch { }
+            try { $script:robloxAutoRetryTriggered = $false } catch { }
+            try { $script:robloxAutoRetryEnabled = $false } catch { }
+
+            # Reset post-start snapshot state for this run.
+            try { $script:ethernetAutoRotateLastProbe = $null } catch { }
+            try { $script:postStartSnapshotEnabled = $false } catch { }
+            try { $script:postStartSnapshotDone = $false } catch { }
+            try { $script:postStartSnapshotNextCheckAt = $null } catch { }
+
             try {
                 $script:networkProfileKey = Get-NetworkProfileKey
                 Write-Log ("BotProfile: key={0}" -f $script:networkProfileKey)
@@ -4148,12 +4549,13 @@ $toggleBtn.Add_Click({
                             Write-Log ("Roblox ingestion: hostsFound={0} ipsFound={1} addedDomains={2} addedIps={3} sampleHosts=[{4}] sampleIps=[{5}]" -f $hosts.Count, $ips.Count, $addedDomains, $addedIps, $script:lastRobloxIngestion.SampleHosts, $script:lastRobloxIngestion.SampleIps)
 
                             $needWidePorts = $false
+                            try { if ($rob -and ($rob.PSObject.Properties.Name -contains 'Has277') -and $rob.Has277) { $needWidePorts = $true } } catch { }
                             try { if ($rob -and ($rob.PSObject.Properties.Name -contains 'Has279') -and $rob.Has279) { $needWidePorts = $true } } catch { }
                             try { if ($rob -and ($rob.PSObject.Properties.Name -contains 'Has529') -and $rob.Has529) { $needWidePorts = $true } } catch { }
 
                             if ($needWidePorts -and (-not $script:gameFilterOverride)) {
                                 $script:gameFilterOverride = '1024-65535'
-                                Write-Log "Roblox ingestion: detected 279/529 in logs; enabling GameFilter=1024-65535 for this run"
+                                Write-Log "Roblox ingestion: detected 277/279/529 in logs; enabling GameFilter=1024-65535 for this run"
                             }
                         }
                     }
