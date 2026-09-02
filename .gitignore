@@ -16,3 +16,4 @@ D-Gen/logs/*
 # --- engine private sources / build output (anti-copy) ---
 /engine/src/
 /engine/out/
+utils/check_updates.enabled

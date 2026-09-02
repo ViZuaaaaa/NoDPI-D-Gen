@@ -5,3 +5,4 @@ set "BIN=%ROOT%\bin"
 set "LISTS=%ROOT%\lists"
 cd /d "%BIN%"
 "%BIN%\DGen.exe" --profile general_fake_tls_auto
+exit /b %ERRORLEVEL%

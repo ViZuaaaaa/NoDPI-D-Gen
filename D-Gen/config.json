@@ -2,10 +2,13 @@
     "domains":  [
                     "discord.com",
                     "youtube.com",
-                    "roblox.com"
+                    "telegram.org",
+                    "amazonaws.com",
+                    "cloudfront.net",
+                    "www.amazon.com"
                 ],
     "targetDescription":  "D-Gen launcher default",
-    "strategy":  "strategies\\general.bat",
+    "strategy":  "strategies\\general (FAKE TLS AUTO ALT3).bat",
     "aggressiveMode":  false,
     "enableRemote":  false,
     "apiKey":  "",

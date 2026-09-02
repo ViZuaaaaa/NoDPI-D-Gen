@@ -8,47 +8,57 @@
     "general.bat": {
       "enabled": true,
       "priority": 100,
-      "tags": ["baseline", "discord", "youtube", "roblox"]
+      "tags": ["baseline", "discord", "youtube", "telegram"]
     },
     "general (CLASSIC).bat": {
       "enabled": true,
       "priority": 99,
-      "tags": ["classic", "no_fake_tls", "discord", "youtube", "roblox", "ethernet"]
+      "tags": ["classic", "no_fake_tls", "discord", "youtube", "telegram", "ethernet"]
     },
     "general (ALT11).bat": {
       "enabled": true,
       "priority": 95,
-      "tags": ["alt", "heavy", "discord", "roblox"]
+      "tags": ["alt", "heavy", "discord", "telegram"]
     },
     "general (FAKE TLS AUTO SYNDATA STRICT).bat": {
       "enabled": true,
       "priority": 94,
-      "tags": ["syndata", "strict", "ethernet", "discord", "roblox"]
+      "tags": ["syndata", "strict", "ethernet", "discord", "telegram"]
     },
     "general (FAKE TLS AUTO ALT3).bat": {
       "enabled": true,
       "priority": 94,
-      "tags": ["fake_tls_auto", "heavy", "discord", "roblox"]
+      "tags": ["fake_tls_auto", "heavy", "discord", "telegram"]
     },
     "general (ALT).bat": {
       "enabled": true,
       "priority": 90,
-      "tags": ["alt", "discord", "youtube", "roblox"]
+      "tags": ["alt", "discord", "youtube", "telegram"]
     },
     "general (ALT7).bat": {
       "enabled": true,
       "priority": 85,
-      "tags": ["alt", "discord", "roblox"]
+      "tags": ["alt", "discord", "telegram"]
     },
     "general (FAKE TLS AUTO).bat": {
       "enabled": true,
       "priority": 80,
-      "tags": ["fake_tls_auto", "discord", "youtube", "roblox"]
+      "tags": ["fake_tls_auto", "discord", "youtube", "telegram"]
     },
     "general (FAKE TLS AUTO SYNDATA).bat": {
       "enabled": true,
       "priority": 79,
-      "tags": ["syndata", "ethernet", "discord", "roblox"]
+      "tags": ["syndata", "ethernet", "discord", "telegram"]
+    },
+    "general (ALT MD5SIG).bat": {
+      "enabled": false,
+      "priority": 70,
+      "tags": ["alt", "core0_extra", "md5sig", "ethernet", "timeout", "discord", "telegram"]
+    },
+    "general (ALT DATANOACK).bat": {
+      "enabled": false,
+      "priority": 69,
+      "tags": ["alt", "core0_extra", "datanoack", "ethernet", "timeout", "discord", "telegram"]
     }
   }
 }

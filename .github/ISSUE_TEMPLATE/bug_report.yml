@@ -31,6 +31,50 @@ body:
     validations:
       required: true
 
+  - type: dropdown
+    id: install_source
+    attributes:
+      label: Откуда вы скачали?
+      description: |
+        Важно: **GitHub "Code ZIP"** (исходники) обычно **не содержит** `bin/` и часто ломает запуск.
+      options:
+        - Release zip (из Releases)
+        - GitHub Code ZIP (исходники)
+        - Другое (опишу ниже)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: link_type
+    attributes:
+      label: Тип подключения
+      options:
+        - Wi‑Fi
+        - Ethernet (кабель)
+        - Mobile hotspot / USB tethering
+        - Другое (опишу ниже)
+    validations:
+      required: true
+
+  - type: textarea
+    id: report
+    attributes:
+      label: Отчёт (Report) / логи
+      description: |
+        1) Нажмите кнопку **Report** в лаунчере (в шапке окна).
+        2) Сохраните `DGen-report-*.zip`.
+        3) **Прикрепите zip к Issue** (перетащите файл в поле комментария).
+
+        Если Report не получается — прикрепите вручную файлы из `D-Gen/logs/`:
+        - `dgen-summary.json` (+ `.prev` если есть)
+        - `engine.log` / `engine.log.prev`
+        - `engine.stdout.log` / `engine.stdout.log.prev`
+        - `dgen-launch.log` (лог лаунчера, если есть)
+      placeholder: |
+        Укажите имя отчёта (пример): DGen-report-20260127-112233.zip
+    validations:
+      required: true
+
   - type: textarea
     id: reproduction
     attributes:
